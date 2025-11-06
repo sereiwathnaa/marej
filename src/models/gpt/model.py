@@ -1,13 +1,12 @@
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from dataclasses import dataclass
 import sys
-sys.path.append("/home/nyxx/my_project/marej/")
+from dataclasses import dataclass
+sys.path.append("/home/nyxx/my_project/marej")
 from src.layers.normalization import LayerNorm
 from src.layers.attention import MultiheadAttention
 import inspect
-import math
 
 @dataclass
 class GPTConfig:
@@ -18,6 +17,7 @@ class GPTConfig:
     embed_dim: int = 768
     dropout_p: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
 
 class GPT(nn.Module):
     def __init__(self,
@@ -35,7 +35,6 @@ class GPT(nn.Module):
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size
         self.block_size = block_size
-        self.bias = bias
 
         self.dropout = nn.Dropout(dropout_p)
 
@@ -50,14 +49,9 @@ class GPT(nn.Module):
 
         self.output_projection = self.word_embeddings.weight
 
-        self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith('to_out.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.n_layers))
-
     def forward(self,
                 indices: Tensor,
-                use_kv_cache: bool=False,
+                use_kv_cache: bool=True,
                 targets: Tensor=None,
                 ):
         offset = self.get_kv_cache_seqlen() if use_kv_cache else 0
@@ -154,22 +148,6 @@ class GPT(nn.Module):
         
         return model
 
-    def clear_kv_cache(self):
-        for decoder_block in self.decoder_blocks:
-            decoder_block.attn.clear_kv_cache()
-
-    def get_kv_cache_seqlen(self):
-        return self.decoder_blocks[0].attn.get_kv_cache_seqlen()
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0., std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0., std=0.02)
-
-
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -195,7 +173,7 @@ class GPT(nn.Module):
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
-    
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -207,7 +185,7 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.word_embeddings.weight.numel()
         return n_params
-    
+
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
@@ -223,32 +201,21 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+    def clear_kv_cache(self):
+        for decoder_block in self.decoder_blocks:
+            decoder_block.attn.clear_kv_cache()
 
-        return idx    
+    def get_kv_cache_seqlen(self):
+        return self.decoder_blocks[0].attn.get_kv_cache_seqlen()
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0., std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0., std=0.02)
+        
 
 class DecoderBlock(nn.Module):
     def __init__(self,

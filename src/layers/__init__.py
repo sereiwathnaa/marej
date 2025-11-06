@@ -1,2 +1,2 @@
 from .normalization import LayerNorm
-from .attention import MultiheadAttention, DotProductAttention
+from .attention import MultiheadAttention
