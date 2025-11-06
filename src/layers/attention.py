@@ -3,7 +3,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange
-from normalization import LayerNorm
+from .normalization import LayerNorm
 
 class MultiheadAttention(nn.Module):
     def __init__(self,
@@ -96,26 +96,26 @@ class DotProductAttention(nn.Module):
         return out
 
 #%%
-torch.manual_seed(0)
-batch, seq_len, embed = 2, 16, 512
-x = torch.randn(batch, seq_len, embed)
+# torch.manual_seed(0)
+# batch, seq_len, embed = 2, 16, 512
+# x = torch.randn(batch, seq_len, embed)
 
-attn_flash = MultiheadAttention(embed_dim=embed, n_heads=8, dim_head=64, dropout_p=0.0, use_flash=True)
-attn_no_flash = MultiheadAttention(embed_dim=embed, n_heads=8, dim_head=64, dropout_p=0.0, use_flash=False)
-attn_no_flash.load_state_dict(attn_flash.state_dict())
+# attn_flash = MultiheadAttention(embed_dim=embed, n_heads=8, dim_head=64, dropout_p=0.0, use_flash=True)
+# attn_no_flash = MultiheadAttention(embed_dim=embed, n_heads=8, dim_head=64, dropout_p=0.0, use_flash=False)
+# attn_no_flash.load_state_dict(attn_flash.state_dict())
 
-attn_flash.eval()
-attn_no_flash.eval()
+# attn_flash.eval()
+# attn_no_flash.eval()
 
-y_flash = attn_flash(x)
-y_no_flash = attn_no_flash(x)
-print("no mask diff:", (y_flash - y_no_flash).abs().max().item())
+# y_flash = attn_flash(x)
+# y_no_flash = attn_no_flash(x)
+# print("no mask diff:", (y_flash - y_no_flash).abs().max().item())
 
-mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
-y_flash_mask = attn_flash(x, attn_mask=mask)
-y_no_flash_mask = attn_no_flash(x, attn_mask=mask)
-print("causal mask diff:", (y_flash_mask - y_no_flash_mask).abs().max().item())
-# %%
-print((y_flash_mask.sum(), y_no_flash_mask.sum()))
-print(y_flash.sum(), y_no_flash.sum())
-# %%
+# mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+# y_flash_mask = attn_flash(x, attn_mask=mask)
+# y_no_flash_mask = attn_no_flash(x, attn_mask=mask)
+# print("causal mask diff:", (y_flash_mask - y_no_flash_mask).abs().max().item())
+# # %%
+# print((y_flash_mask.sum(), y_no_flash_mask.sum()))
+# print(y_flash.sum(), y_no_flash.sum())
+# # %%
