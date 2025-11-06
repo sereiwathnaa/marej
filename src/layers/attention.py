@@ -23,7 +23,7 @@ class MultiheadAttention(nn.Module):
         self.to_qkv = nn.Linear(inner_dim, inner_dim * 3, bias=bias)
         self.to_out = nn.Linear(inner_dim, embed_dim, bias=bias)       
 
-        self.kv_cache: tuple[torch.Tensor]
+        self.kv_cache: tuple[torch.Tensor] = None
         self.use_flash = hasattr(F, "scaled_dot_product_attention") & use_flash
         self.attn = DotProductAttention(self.use_flash, dropout_p=dropout_p)
     

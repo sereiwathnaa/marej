@@ -6,10 +6,9 @@ import pygments
 import numpy as np
 from typing import Dict
 from IPython.display import clear_output
-
 import torch
-from nlp.generation import batch_generation
 
+import torch.nn.functional as F
 
 def interactive_conversation(model,
                              chat_template,
@@ -319,3 +318,142 @@ class StdoutWithSyntaxHighlighting:
             formatter=pygments.formatters.Terminal256Formatter(style='default')
         )
     
+
+def batch_generation(model, 
+                     indices: torch.Tensor,
+                     n_tokens_to_gen: int,
+                     top_k: int = None,
+                     top_p: float = None,
+                     temperature: float = 1.0,
+                     sample: bool = True,
+                     use_kv_cache: bool = True):
+    """Generates batch of responses with KV caching.
+    
+    NOTE: If KV caching, we will guarantee that:
+        (kv_cache_seqlen after) == (kv_cache_seqlen before) + len(indices) + len(response)
+    This will be true even if the generator terminates early, as long as generator.close() is called
+
+    Args:
+        model: Model instance. model should take in tensors of shape (batch, seqlen) and output logits of
+            shape (batch, seqlen, vocab_size).
+        indices (Tensor): Conditioning sequence with shape (batch, seqlen).
+        n_tokens_to_gen (int): Number of tokens to generate.
+        top_k (int): Filter probabilities to those in the top k.
+        top_p (int): Nucleus sampling. Filter to top probs such that the sum is just less than top_p.
+        temperature (float: Higher temperature raises the likelihood of lower probability sequences.
+        sample (bool): True to randomly sample sequences from the distribution of probabilities
+            False to take argmax.
+        use_kv_cache (bool): If True, uses kv_cache to speed up inference.
+            If generator terminates early, make sure to call generator.close() to properly maintain the KV cache.
+            
+            After generation, we will guarantee that:
+                (kv_cache_seqlen after) == (kv_cache_seqlen before) + len(indices) + len(response)
+            
+    Returns
+        generator. The generator will yield tokens as soon as they are sampled.
+            
+    Examples:
+        (Pseudocode) In the following, response2 == kv_response2 while being faster to generate.
+    
+            prompt1 = 'Hi, I am John.'
+            prompt2 = 'That is great.'
+    
+            response1 = batch_generation(prompt1, use_kv_cache=False)
+            response2 = batch_generation(prompt1 + response1 + prompt2, use_kv_cache=False)
+    
+            response1 = batch_generation(prompt1, use_kv_cache=True)
+            kv_response2 = batch_generation(prompt2, use_kv_cache=True)
+
+    """
+    model.eval()
+
+    for token_n in range(n_tokens_to_gen):
+        if indices.shape[1] >= model.block_size:
+            raise RuntimeError(f'Conversation has reached the limit of {model.block_size} tokens.')
+
+        with torch.no_grad():
+            indices_to_input = indices
+            if use_kv_cache:
+                # After the first step, feed in one token at a time
+                if token_n > 0:
+                    indices_to_input = indices_to_input[:, -1:]
+
+            next_token_logits = model(indices_to_input, use_kv_cache=use_kv_cache)[:, -1]
+
+        probs = F.softmax(next_token_logits / (temperature + 1e-6), dim=-1).T  # shape (vocab_size, batch)
+        (vocab_size, batch) = probs.shape
+
+        if top_k is not None:
+            probs = top_k_sample(probs, top_k)
+
+        if top_p is not None:
+            probs = nucleus_sample(probs, top_p)
+
+        if sample:
+            next_indices = [torch.multinomial(probs[:, i], 1).item()
+                            for i in range(batch)]
+        else:
+            next_indices = torch.argmax(probs, dim=0).tolist()
+
+        next_indices_tensor = torch.tensor(next_indices, dtype=torch.long, device=indices.device)[:, None]
+
+        try:
+            yield next_indices
+        except GeneratorExit:
+            # This means that the generator exited early. We have to feed the last
+            # generated indices back in to maintain the KV cache
+            if use_kv_cache:
+                _ = model(next_indices_tensor, use_kv_cache=True)
+            return
+
+        indices = torch.cat([indices, next_indices_tensor], dim=1)
+
+    # We have to feed the last generated indices back in to maintain the KV cache
+    if use_kv_cache:
+        _ = model(next_indices_tensor, use_kv_cache=True)
+        
+        
+def top_k_sample(probs: torch.Tensor,
+                 top_k: int):
+    """Top-k sampling.
+    
+    Args:
+        probs (torch.Tensor): Tensor of probabilities with shape (vocab_size, batch).
+            Modifies probs in place.
+        top_k (int): Top K words to filter to.
+    
+    """
+    # For each row, zero out everything except for top_k probs per row
+    top_k_prob = torch.sort(probs, dim=0)[0][-top_k, :]
+    probs[probs < top_k_prob] = 0
+    
+    probs /= probs.sum(dim=0)
+    
+    return probs
+
+
+def nucleus_sample(probs: torch.Tensor,
+                   top_p: float):
+    """Nucleus sampling. Filter to top probs such that the sum prob is just less than top_p.
+    
+    References:
+        [1] Ari Holtzman, Jan Buys, Li Du, Maxwell Forbes, Yejin Choi.
+            The Curious Case of Neural Text Degeneration. arXiv:1904.09751, 2019
+    
+    Args:
+        probs (torch.Tensor): Tensor of probabilities with shape (vocab_size, batch).
+            Modifies probs in place.
+        top_p (float): Filter to the top `k` probs such that the sum probs is <= top_p and k is largest.
+    
+    """
+    sorted_probs = torch.sort(probs, dim=0, descending=True)[0]
+    cum_probs = torch.cumsum(sorted_probs, dim=0)
+    top_k = (cum_probs <= top_p).sum(dim=0)
+
+    ranking = probs.shape[0] - torch.argsort(torch.argsort(probs, dim=0), dim=0)
+    mask = (ranking <= top_k) | (ranking == 1)  # | (ranking == 1) accounts for when the edge case if highest prob > top_p
+
+    probs[~mask] = 0
+    probs /= probs.sum(dim=0)
+
+    return probs

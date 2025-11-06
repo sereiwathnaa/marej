@@ -68,7 +68,7 @@ def batch_generation(model,
                 if token_n > 0:
                     indices_to_input = indices_to_input[:, -1:]
 
-            next_token_logits = model(indices_to_input, use_kv_cache)[:, -1]
+            next_token_logits = model(indices_to_input, use_kv_cache=use_kv_cache)[:, -1]
 
         probs = F.softmax(next_token_logits / (temperature + 1e-6), dim=-1).T  # shape (vocab_size, batch)
         (vocab_size, batch) = probs.shape

@@ -142,7 +142,6 @@ if os.path.exists(meta_path):
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
 # model init
 model_args = dict(n_layers=n_layers, n_heads=n_heads, embed_dim=embed_dim, block_size=block_size,
                   bias=bias, vocab_size=None, dropout_p=dropout_p) # start with model_args from command line
@@ -252,6 +251,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+model.train()
 while True:
 
     # determine and set the learning rate for this iteration

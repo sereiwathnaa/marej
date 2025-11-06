@@ -3,7 +3,7 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 import sys
 from dataclasses import dataclass
-sys.path.append("/home/nyxx/my_project/marej")
+sys.path.append("/home/nyxx/my_project/marejv2")
 from src.layers.normalization import LayerNorm
 from src.layers.attention import MultiheadAttention
 import inspect
@@ -46,7 +46,7 @@ class GPT(nn.Module):
         )
 
         self.layer_norm = LayerNorm(embed_dim, bias=bias)
-
+        self.kv_cache: tuple[Tensor] = None
         self.output_projection = self.word_embeddings.weight
 
     def forward(self,
@@ -69,6 +69,32 @@ class GPT(nn.Module):
             return logits, loss
         return logits
     
+    @torch.no_grad()
+    def generate_sample(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits = self.forward(idx_cond, targets=None, use_kv_cache=False)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
 
     @staticmethod
     def from_pretrained(model_name: str):
@@ -200,7 +226,7 @@ class GPT(nn.Module):
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
-
+    
     def clear_kv_cache(self):
         for decoder_block in self.decoder_blocks:
             decoder_block.attn.clear_kv_cache()
@@ -255,4 +281,4 @@ class FeedForwardBlock(nn.Module):
         x = self.linear2(x)
         return x
     
-model = GPT.from_pretrained("gpt2")
+# model = GPT.from_pretrained("gpt2")
