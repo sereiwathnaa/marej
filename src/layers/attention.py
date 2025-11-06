@@ -16,6 +16,7 @@ class MultiheadAttention(nn.Module):
         super().__init__()
         assert embed_dim % n_heads == 0
         inner_dim = dim_head * n_heads
+        self.embed_dim = embed_dim
         self.n_heads = n_heads
         self.norm = LayerNorm(embed_dim)
         self.to_qkv = nn.Linear(inner_dim, inner_dim * 3, bias=bias)
@@ -25,8 +26,44 @@ class MultiheadAttention(nn.Module):
         self.use_flash = hasattr(F, "scaled_dot_product_attention")
         self.attn = DotProductAttention(use_flash=use_flash, dropout_p=dropout_p)
     
-    # def forward(self, x):
+    def forward(self,
+                x: Tensor,
+                attn_mask: Tensor=None,
+                use_kv_cache: bool=False):
+        
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        query, key, value = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.n_heads), qkv)
 
+        if use_kv_cache:
+            if self.training:
+                raise RuntimeError("MultiheadAttention must be in .eval() mode if using KV caching.")
+            if self.kv_cache is not None:
+                (key_cache, value_cache) = self.kv_cache
+                key = torch.cat([key_cache, key], dim=2)
+                value = torch.cat([value_cache, value], dim=2)
+
+                if attn_mask is not None:
+                    cache_attn_mask = torch.zeros((len(attn_mask), self.get_kv_cache_seqlen()), dtype=attn_mask.dtype, device=attn_mask.device)
+                    attn_mask = torch.cat([cache_attn_mask, attn_mask], dim=1)
+            
+            self.kv_cache = (key.detach(), value.detach())
+
+        attn_output = self.attn(query, key, value, attn_mask)
+        out = self.to_out(attn_output)
+        return out
+
+    def get_kv_cache_seqlen(self):
+        if self.kv_cache is None:
+            return 0
+        else:
+            return self.kv_cache[0].shape[2]
+        
+    def clear_kv_cache(self):
+        self.kv_cache = None
+
+    def __repr__(self):
+        return (f'MultiheadAttention(embed_dim={self.embed_dim}, '
+                f'n_heads={self.n_heads})')
 
 
 class DotProductAttention(nn.Module):
