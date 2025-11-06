@@ -1,8 +1,9 @@
+#%%
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange
-from .normalization import LayerNorm
+from normalization import LayerNorm
 
 class MultiheadAttention(nn.Module):
     def __init__(self,
@@ -10,8 +11,8 @@ class MultiheadAttention(nn.Module):
                  n_heads: int=8,
                  dim_head: int=64,
                  dropout_p: float=0.,
-                 use_flash: bool=True,
                  bias: bool=True,
+                 use_flash=True,
                  batch_first: bool=True):
         super().__init__()
         assert embed_dim % n_heads == 0
@@ -23,8 +24,8 @@ class MultiheadAttention(nn.Module):
         self.to_out = nn.Linear(inner_dim, embed_dim, bias=bias)       
 
         self.kv_cache: tuple[torch.Tensor]
-        self.use_flash = hasattr(F, "scaled_dot_product_attention")
-        self.attn = DotProductAttention(use_flash=use_flash, dropout_p=dropout_p)
+        self.use_flash = hasattr(F, "scaled_dot_product_attention") & use_flash
+        self.attn = DotProductAttention(self.use_flash, dropout_p=dropout_p)
     
     def forward(self,
                 x: Tensor,
@@ -67,7 +68,7 @@ class MultiheadAttention(nn.Module):
 
 
 class DotProductAttention(nn.Module):
-    def __int__(self, use_flash: bool=True, dropout_p: float=0.):
+    def __init__(self, use_flash: bool=True, dropout_p: float=0.):
         super().__init__()
         self.dropout = dropout_p
         self.use_flash = use_flash
@@ -81,15 +82,40 @@ class DotProductAttention(nn.Module):
             if attn_mask is not None:
                 out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask.bool().logical_not(), dropout_p=self.dropout if self.training else 0.)
             else:
-                out = F.scaled_dot_product_attention(query, key, value, dropout_p=self.dropout if self.training else 0., is_causal=True)
+                out = F.scaled_dot_product_attention(query, key, value, dropout_p=self.dropout if self.training else 0., is_causal=False)
             out = rearrange(out, "b h l d -> b l (h d)")
         else:
-            logits = torch.einsum("b h i d, b h j d -> b h i j", query, key) * key.shape[-1] ** -0.5
+            logits = torch.einsum("b h i d, b h j d -> b h i j", query, key) * query.shape[-1] ** -0.5
             if attn_mask is not None:
-                logits = logits.masked_fill(attn_mask.bool(), value=float("-inf"))
+                logits = logits.masked_fill(attn_mask.bool(), value=-1e9)
             attn = F.softmax(logits, dim=-1)
-            attn = F.dropout(self.dropout)
+            attn = F.dropout(attn, self.dropout)
             out = torch.einsum("b h i j, b h j d -> b h i d", attn, value)
             out = rearrange(out, "b h l d -> b l (h d)")
 
         return out
+
+#%%
+torch.manual_seed(0)
+batch, seq_len, embed = 2, 16, 512
+x = torch.randn(batch, seq_len, embed)
+
+attn_flash = MultiheadAttention(embed_dim=embed, n_heads=8, dim_head=64, dropout_p=0.0, use_flash=True)
+attn_no_flash = MultiheadAttention(embed_dim=embed, n_heads=8, dim_head=64, dropout_p=0.0, use_flash=False)
+attn_no_flash.load_state_dict(attn_flash.state_dict())
+
+attn_flash.eval()
+attn_no_flash.eval()
+
+y_flash = attn_flash(x)
+y_no_flash = attn_no_flash(x)
+print("no mask diff:", (y_flash - y_no_flash).abs().max().item())
+
+mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+y_flash_mask = attn_flash(x, attn_mask=mask)
+y_no_flash_mask = attn_no_flash(x, attn_mask=mask)
+print("causal mask diff:", (y_flash_mask - y_no_flash_mask).abs().max().item())
+# %%
+print((y_flash_mask.sum(), y_no_flash_mask.sum()))
+print(y_flash.sum(), y_no_flash.sum())
+# %%
