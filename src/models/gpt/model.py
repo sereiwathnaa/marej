@@ -50,7 +50,7 @@ class DecoderBlock(nn.Module):
     def forward(self,
                 x: Tensor,
                 use_kv_cache: bool=True):
-        causal_attn_mask = torch.triu(torch.ones(x.shape[1], x.shape[1], device=x.device))
+        causal_attn_mask = torch.triu(torch.ones(x.shape[1], x.shape[1], device=x.device), diagonal=1)
         out = self.attn(x, causal_attn_mask, use_kv_cache)
         return out
 
