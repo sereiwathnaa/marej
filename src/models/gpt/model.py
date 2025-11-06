@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import nn, Tensor
 import torch.nn.functional as F
 
 from layers.normalization import LayerNorm
@@ -46,7 +46,13 @@ class DecoderBlock(nn.Module):
         self.attn = MultiheadAttention(embed_dim, n_heads, dim_head, dropout_p, use_flash=True)
         self.ln2 = LayerNorm(embed_dim)
         self.ffn = FeedForwardBlock(embed_dim, embed_dim * 4)
-    pass
+    
+    def forward(self,
+                x: Tensor,
+                use_kv_cache: bool=True):
+        causal_attn_mask = torch.triu(torch.ones(x.shape[1], x.shape[1], device=x.device))
+        out = self.attn(x, causal_attn_mask, use_kv_cache)
+        return out
 
 class FeedForwardBlock(nn.Module):
     def __init__(self,
