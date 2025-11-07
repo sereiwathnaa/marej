@@ -19,7 +19,6 @@ class LlamaTokenizer(Tokenizer):
             List of integers representing encoded string.  
         """
         encoded = []
-
         # We manually replace <s> and </s> with the correct bos/eos ids
         match = re.search('<s>|</s>', text)
         while match is not None:

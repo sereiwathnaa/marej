@@ -1,3 +1,4 @@
+
 # NOTE: this is copied from https://github.com/google/sentencepiece/blob/master/python/src/sentencepiece/sentencepiece_model_pb2.py
 
 # -*- coding: utf-8 -*-

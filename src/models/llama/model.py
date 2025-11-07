@@ -1,8 +1,10 @@
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from layers.attention import GroupedQueryRotaryAttention
-from layers.normalization import RMSNorm
+import sys
+sys.path.append("/home/nyxx/my_project/marejv2/")
+from src.layers.attention import GroupedQueryRotaryAttention
+from src.layers.normalization import RMSNorm
 from typing import Tuple
 from transformers import AutoModelForCausalLM
 
@@ -34,6 +36,7 @@ class DecoderBlock(nn.Module):
                  use_flash: bool,
                  ):
         super().__init__()
+
         self.norm1 = RMSNorm(embed_dim, eps=norm_eps)
         self.attn = GroupedQueryRotaryAttention(
             embed_dim, n_heads, n_kv_heads,
@@ -100,6 +103,40 @@ class Llama(nn.Module):
 
         self.word_embeddings = nn.Embedding(vocab_size, embed_dim)
         self.decoder_blocks = nn.ModuleList(
-            [DecoderBlock(embed_dim, ffn_hidden_dim, n_heads, n_kv_heads, block_size, rotary_base, norm_eps, use_flash)]
+            [DecoderBlock(embed_dim, ffn_hidden_dim, n_heads, n_kv_heads, block_size, rotary_base, norm_eps, use_flash) for _ in range(n_layers)]
         )
+        
+        self.rms_norm = RMSNorm(embed_dim, eps=norm_eps)
+        # No tying weight like palm, gpt, llama
+        self.output_projection = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.rotation_matr = self.decoder_blocks[0].attn.compute_rotation_matrix()
+
+    def forward(self,
+                indices: Tensor,
+                use_kv_cache: bool=False):
+        x = self.word_embeddings(indices)
+        for decoder_block in self.decoder_blocks:
+            x = decoder_block(x, use_kv_cache, self.rotation_matr)
+
+        x = self.rms_norm(x)
+        logits = self.output_projection(x)
+
+        return logits
+
+    @staticmethod
+    def from_pretrained(model_name: str,
+                        model_dir: str):
+        from transformers import AutoModelForCausalLModel
         pass
+
+
+model = Llama(
+    n_layers=6,
+    n_heads=32,
+    embed_dim=4096,
+    vocab_size=32000,
+    block_size=2048,
+    n_kv_heads=None,
+    ffn_hidden_dim=None,
+    use_flash=True
+).cuda()

@@ -3,7 +3,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from normalization import LayerNorm
+from .normalization import LayerNorm
 from typing import Tuple
 
 class DotProductAttention(nn.Module):
@@ -154,8 +154,8 @@ import torch
 import torch.nn as nn
 
 # Example configuration for GroupedQueryRotaryAttention
-embed_dim = 512
-n_heads = 8
+embed_dim = 1024
+n_heads = 16
 n_kv_heads = 4  # Grouped query attention with fewer KV heads
 dropout_p = 0.1
 apply_rotary_embedding = True
@@ -180,37 +180,37 @@ attention = GroupedQueryRotaryAttention(
 )
 
 # Prepare input tensor (batch_size, seq_len, embed_dim)
-batch_size = 2
-seq_len = 64
-x = torch.randn(batch_size, seq_len, embed_dim)
+# batch_size = 2
+# seq_len = 64
+# x = torch.randn(batch_size, seq_len, embed_dim)
 
-# Set to eval mode for KV cache usage
-attention.eval()
+# # Set to eval mode for KV cache usage
+# attention.eval()
 
-# Forward pass without KV cache
-output_no_cache = attention(x)
+# # Forward pass without KV cache
+# output_no_cache = attention(x)
 
-print(f"Output shape without KV cache: {output_no_cache.shape}")
+# print(f"Output shape without KV cache: {output_no_cache.shape}")
 
-# Forward pass with KV cache (simulate incremental generation)
-attention.clear_kv_cache()  # Ensure cache is cleared
+# # Forward pass with KV cache (simulate incremental generation)
+# attention.clear_kv_cache()  # Ensure cache is cleared
 
-# First chunk
-x_chunk1 = x[:, :32, :]  # First 32 tokens
-output_chunk1 = attention(x_chunk1, use_kv_cache=True)
+# # First chunk
+# x_chunk1 = x[:, :32, :]  # First 32 tokens
+# output_chunk1 = attention(x_chunk1, use_kv_cache=True)
 
-print(f"Output shape for chunk 1: {output_chunk1.shape}")
-print(f"KV cache sequence length after chunk 1: {attention.get_kv_cache_seqlen()}")
+# print(f"Output shape for chunk 1: {output_chunk1.shape}")
+# print(f"KV cache sequence length after chunk 1: {attention.get_kv_cache_seqlen()}")
 
-# Second chunk (continuing from cache)
-x_chunk2 = x[:, 32:64, :]  # Next 32 tokens
-output_chunk2 = attention(x_chunk2, use_kv_cache=True)
+# # Second chunk (continuing from cache)
+# x_chunk2 = x[:, 32:64, :]  # Next 32 tokens
+# output_chunk2 = attention(x_chunk2, use_kv_cache=True)
 
-print(f"Output shape for chunk 2: {output_chunk2.shape}")
-print(f"KV cache sequence length after chunk 2: {attention.get_kv_cache_seqlen()}")
+# print(f"Output shape for chunk 2: {output_chunk2.shape}")
+# print(f"KV cache sequence length after chunk 2: {attention.get_kv_cache_seqlen()}")
 
-# Clear cache when done
-attention.clear_kv_cache()
+# # Clear cache when done
+# attention.clear_kv_cache()
 
 #%%
 

@@ -42,21 +42,32 @@ class ScratchLayerNorm(nn.Module):
 
         return x_normalized
 
-class ScratchRMSNorm(nn.Module):
-    def __init__(self, normalized_shape: Union[int, tuple[int]],
-                 dim: Union[int, tuple[int]]=None,
-                 eps: float=1e-5):
-        if isinstance(normalized_shape, int):
-            normalized_shape = (normalized_shape, )
-        self.normalized_shape = tuple(normalized_shape)
+class RMSNorm(nn.Module):
+    
+    def __init__(self,
+                 normalized_shape: Union[int, Tuple[int]], 
+                 axis: Union[int, Tuple[int]] = None,
+                 eps: float = 1e-5):
 
-        self.dim = tuple([-i for i in range(1 , 1+len(normalized_shape))])
+        super().__init__()
+        
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+            
+        self.normalized_shape = tuple(normalized_shape)
+        self.axis = tuple([-i for i in range(1, 1 + len(normalized_shape))])
         self.eps = eps
 
         self.weight = nn.Parameter(torch.ones(normalized_shape))
-
+        
+        
     def forward(self, x):
-        rms = (x ** 2).mean(dim=self.dim, keepdims=True)
-        x_normalized = x / (rms + self.eps) ** 0.5
+        # Calculate RMS along the specified axis
+        # Using torch.mean with dim parameter
+        rms_sq = torch.mean(x ** 2, dim=self.axis, keepdim=True)
+        
+        # Normalize and scale
+        x_normalized = x / torch.sqrt(rms_sq + self.eps)
         x_normalized = x_normalized * self.weight
+
         return x_normalized
