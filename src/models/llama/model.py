@@ -1,7 +1,9 @@
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-
+from layers.attention import GroupedQueryRotaryAttention
+from layers.normalization import RMSNorm
+from typing import Tuple
 from transformers import AutoModelForCausalLM
 
 class FeedForwardBlock(nn.Module):
@@ -18,6 +20,47 @@ class FeedForwardBlock(nn.Module):
         x = self.linear2(x)
         return x
 
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self,
+                 embed_dim: int,
+                 ffn_hidden_dim: int,
+                 n_heads: int,
+                 n_kv_heads: int,
+                 block_size: int,
+                 rotary_base: int,
+                 norm_eps: float,
+                 use_flash: bool,
+                 ):
+        super().__init__()
+        self.norm1 = RMSNorm(embed_dim, eps=norm_eps)
+        self.attn = GroupedQueryRotaryAttention(
+            embed_dim, n_heads, n_kv_heads,
+            dropout_p=0., apply_rotary_embedding=True,
+            max_seqlen=block_size, bias=False, use_flash=True,
+            batch_first=True
+        )
+        self.norm2 = RMSNorm(embed_dim, eps=norm_eps)
+        self.ffn = FeedForwardBlock(embed_dim, ffn_hidden_dim)
+
+    def forward(self,
+                x: Tensor,
+                use_kv_cache: bool,
+                rotation_matr: Tuple[Tensor, Tensor]=None):
+        x = x + self.self_attn(self.norm1(x), use_kv_cache, rotation_matr)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+    def self_attn(self,
+                  x: Tensor,
+                  use_kv_cache: bool,
+                  rotation_matr: Tuple[Tensor, Tensor]=None):
+        causal_attn_mask = torch.ones((x.shape[1], x.shape[1]), device=x.device).triu(1)
+        out = self.attn(x, x, x, causal_attn_mask, use_kv_cache, rotation_matr)
+        return out
+
+
 class Llama(nn.Module):
     def __init__(self,
                  n_layers: int,
@@ -28,7 +71,8 @@ class Llama(nn.Module):
                  n_kv_heads: int=None,
                  ffn_hidden_dim: int=None,
                  rotary_base: int=10000,
-                 norm_eps: float=1e-5):
+                 norm_eps: float=1e-5,
+                 use_flash: bool=True):
         super().__init__()
 
         # MultiHeadRotaryAttention in this case
