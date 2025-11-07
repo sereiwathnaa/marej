@@ -4,6 +4,19 @@ import torch.nn.functional as F
 
 from transformers import AutoModelForCausalLM
 
+class FeedForwardBlock(nn.Module):
+    def __init__(self,
+                 input_dim: int,
+                 ffn_hidden_dim: int):
+        super().__init__()
+        self.linear1 = nn.Linear(input_dim, ffn_hidden_dim, bias=False)
+        self.linear2 = nn.Linear(ffn_hidden_dim, input_dim, bias=False)
+        self.linear3 = nn.Linear(input_dim, ffn_hidden_dim, bias=False)
+
+    def forward(self, x):
+        x = F.silu(self.linear1(x)) * self.linear3(x) # SwiGLU "activation"
+        x = self.linear2(x)
+        return x
 
 class Llama(nn.Module):
     def __init__(self,
