@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from .normalization import LayerNorm
 
+
+
 class MultiheadAttention(nn.Module):
     def __init__(self,
                  embed_dim: int=512,

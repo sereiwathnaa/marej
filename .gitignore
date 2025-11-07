@@ -2,3 +2,9 @@
 *.pt
 *.bin
 srcopy/
+/out-shakespeare-char
+/out-shakespeare-bpe
+*.github
+/docs
+CHANGES.md
+vault
