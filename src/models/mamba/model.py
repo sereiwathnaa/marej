@@ -51,9 +51,40 @@ class MambaBlock(nn.Module):
 
     def forward(self, x):
         x, res = self.in_proj(x).chunk(2, dim=-1)
-        x = self.conv1d()
+        x = self.conv1d(x)
+        x = F.silu(x)
+        y = self.ssm(x)
         pass
-    
+
+    def ssm(self, x):
+        (d_in, n) = self.A_log.shape
+        A = -torch.exp(self.A_log)
+        D = self.D
+        x_dbl = self.proj(x)
+        (delta, B, C) = x_dbl.split(split_size=[self.args.dt_rank, n, n], dim=-1)
+        delta = F.softplus(self.dt_proj(delta))
+        y = self.selective_scan(x, delta, A, B, C, D)
+        pass
+
+    def selective_scan(self, u, delta, A, B, C, D):
+        (b, l, d_in) = u.shape
+        n = A.shape[1]
+
+        delta = delta[..., None]
+        deltaA = torch.exp(delta * A)
+        deltaB_u = delta * B[:, :, None] * u[..., None]
+        x = torch.zeros((b, d_in, n))
+        ys = []
+        for i in range(l):
+            x = delta[:, i] * x + deltaB_u[:, i]
+            y = torch.einsum('bij,bjk->bik', x, C[:, i, :, None]).squeeze(-1)
+            ys.append(y)
+
+        y = torch.cat(ys, dim=2).transpose(1, 2)
+        y = y + u * D
+        return y
+        
+        
     def conv1d(self, x):
         b, l, d_in = x.shape
         padding = torch.zeros((b, self.args.d_conv - 1, d_in))
