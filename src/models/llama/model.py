@@ -130,13 +130,13 @@ class Llama(nn.Module):
         pass
 
 
-model = Llama(
-    n_layers=6,
-    n_heads=32,
-    embed_dim=4096,
-    vocab_size=32000,
-    block_size=2048,
-    n_kv_heads=None,
-    ffn_hidden_dim=None,
-    use_flash=True
-).cuda()
+# model = Llama(
+#     n_layers=6,
+#     n_heads=32,
+#     embed_dim=4096,
+#     vocab_size=32000,
+#     block_size=2048,
+#     n_kv_heads=None,
+#     ffn_hidden_dim=None,
+#     use_flash=True
+# ).cuda()
