@@ -54,7 +54,9 @@ class MambaBlock(nn.Module):
         x = self.conv1d(x)
         x = F.silu(x)
         y = self.ssm(x)
-        pass
+        y = y * F.silu(res)
+        output = self.out_proj(y)
+        return output
 
     def ssm(self, x):
         (d_in, n) = self.A_log.shape
@@ -64,7 +66,7 @@ class MambaBlock(nn.Module):
         (delta, B, C) = x_dbl.split(split_size=[self.args.dt_rank, n, n], dim=-1)
         delta = F.softplus(self.dt_proj(delta))
         y = self.selective_scan(x, delta, A, B, C, D)
-        pass
+        return y
 
     def selective_scan(self, u, delta, A, B, C, D):
         (b, l, d_in) = u.shape
@@ -77,7 +79,8 @@ class MambaBlock(nn.Module):
         ys = []
         for i in range(l):
             x = delta[:, i] * x + deltaB_u[:, i]
-            y = torch.einsum('bij,bjk->bik', x, C[:, i, :, None]).squeeze(-1)
+            y = torch.sum(x * C[:, i:i+1, :], dim=-1)
+            y = rearrange(y, "b d -> b 1 d")
             ys.append(y)
 
         y = torch.cat(ys, dim=2).transpose(1, 2)
