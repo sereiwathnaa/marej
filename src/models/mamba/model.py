@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat, einsum
 import math
 from dataclasses import dataclass
+
 from typing import Union
 import sys
 sys.path.append("/home/nyxx/my_project/marejv2/")
@@ -46,19 +47,10 @@ class Mamba(nn.Module):
         self.layers = nn.ModuleList([ResidualBlock(args) for _ in range(args.n_layer)])
         self.norm_f = RMSNorm(args.d_model)
 
-        # Tie output projection to embedding weights (Weight Tying)
         self.lm_head = self.embedding
 
     def forward(self, input_ids, use_kv_cache: bool = False):
-        """
-        Args:
-            input_ids (long tensor): shape (b, l)
-            use_kv_cache (bool): dummy parameter to maintain compatibility with generation scripts.
-    
-        Returns:
-            logits: shape (b, l, vocab_size)
 
-        """
         x = self.embedding(input_ids)
         
         for layer in self.layers:
@@ -68,31 +60,9 @@ class Mamba(nn.Module):
         logits = einsum(x, self.lm_head.weight, 'b l d, v d -> b l v')
 
         return logits
-
-    @staticmethod
-    def from_pretrained(pretrained_model_name: str):
-        """Load pretrained weights from HuggingFace into model.
     
-        Args:
-            pretrained_model_name: One of
-                * 'state-spaces/mamba-2.8b-slimpj'
-                * 'state-spaces/mamba-2.8b'
-                * 'state-spaces/mamba-1.4b'
-                * 'state-spaces/mamba-790m'
-                * 'state-spaces/mamba-370m'
-                * 'state-spaces/mamba-130m'
-                            
-        Returns:
-            model: Mamba model with weights loaded
-    
-        """
-        from .loadpretrained import load_pretrained_mamba
-        return load_pretrained_mamba(pretrained_model_name)
-        
-
 class ResidualBlock(nn.Module):
     def __init__(self, args: ModelArgs):
-        """Simple block wrapping Mamba block with normalization and residual connection."""
         super().__init__()
         self.args = args
         self.mixer = MambaBlock(args)
@@ -119,20 +89,15 @@ class MambaBlock(nn.Module):
 
         self.in_proj = nn.Linear(args.d_model, args.d_inner * 2, bias=args.bias)
 
-        self.conv1d = nn.Conv1d(
-            in_channels=args.d_inner,
-            out_channels=args.d_inner,
-            bias=args.conv_bias,
-            kernel_size=args.d_conv,
-            groups=args.d_inner,
-            padding=args.d_conv - 1,
-        )
-
         # x_proj takes in `x` and outputs the input-specific Δ, B, C
         self.x_proj = nn.Linear(args.d_inner, args.dt_rank + args.d_state * 2, bias=False)
         
         # dt_proj projects Δ from dt_rank to d_in
         self.dt_proj = nn.Linear(args.dt_rank, args.d_inner, bias=True)
+
+        self.conv1d = nn.Conv1d(
+            args.d_inner, args.d_inner, args.d_conv, bias=args.conv_bias, groups=args.d_inner, padding=args.d_conv - 1
+        )
 
         A = repeat(torch.arange(1, args.d_state + 1), 'n -> d n', d=args.d_inner)
         self.A_log = nn.Parameter(torch.log(A))
@@ -169,22 +134,8 @@ class MambaBlock(nn.Module):
         return output
 
     def ssm(self, x):
-        """Runs the SSM. See Algorithm 2 in Section 3.2 in the Mamba paper [1]
 
-        Args:
-            x: shape (b, l, d_in)
-    
-        Returns:
-            output: shape (b, l, d_in)
-
-        """
         (d_in, n) = self.A_log.shape
-        
-        # Compute ∆ A B C D, the state space parameters.
-        #     A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
-        #     ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
-        #                                  and is why Mamba is called **selective** state spaces)
-        
         A = -torch.exp(self.A_log.float())
         D = self.D.float()
         
@@ -199,28 +150,7 @@ class MambaBlock(nn.Module):
         return y
 
     def selective_scan(self, u, delta, A, B, C, D):
-        """Does selective scan algorithm. See:
-            - Section 2 State Space Models in the Mamba paper [1]
-            - Algorithm 2 in Section 3.2 in the Mamba paper [1]
-            - run_SSM(A, B, C, u) in The Annotated S4 [2]
 
-        This is the classic discrete state space formula:
-            x(t + 1) = Ax(t) + Bu(t)
-            y(t)     = Cx(t) + Du(t)
-        except B and C (and the step size delta, which is used for discretization) are dependent on the input x(t).
-    
-        Args:
-            u: shape (b, l, d_in)    (See Glossary at top for definitions of b, l, d_in, n...)
-            delta: shape (b, l, d_in)
-            A: shape (d_in, n)
-            B: shape (b, l, n)
-            C: shape (b, l, n)
-            D: shape (d_in,)
-    
-        Returns:
-            output: shape (b, l, d_in)
-    
-        """
         (b, l, d_in) = u.shape
         n = A.shape[1]
 
@@ -244,32 +174,204 @@ class MambaBlock(nn.Module):
         y = y + u * D
 
         return y
+    
+
+#%%
+import json
+from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+from transformers.utils.hub import cached_file
+
+
+def load_pretrained_mamba(pretrained_model_name: str, device=None):
+    """Load pretrained weights from HuggingFace into PyTorch Mamba model.
+    
+    Args:
+        pretrained_model_name: One of
+            * 'state-spaces/mamba-2.8b-slimpj'
+            * 'state-spaces/mamba-2.8b'
+            * 'state-spaces/mamba-1.4b'
+            * 'state-spaces/mamba-790m'
+            * 'state-spaces/mamba-370m'
+            * 'state-spaces/mamba-130m'
+        device: Device to load model on (default: None, stays on CPU)
+                        
+    Returns:
+        model: Mamba model with pretrained weights loaded
+    """    
+    def load_config_hf(model_name):
+        resolved_archive_file = cached_file(
+            model_name, 
+            CONFIG_NAME,
+            _raise_exceptions_for_missing_entries=False
+        )
+        return json.load(open(resolved_archive_file))
+    
+    def load_state_dict_hf(model_name):
+        resolved_archive_file = cached_file(
+            model_name, 
+            WEIGHTS_NAME,
+            _raise_exceptions_for_missing_entries=False
+        )
+        return torch.load(
+            resolved_archive_file, 
+            weights_only=True, 
+            map_location='cpu', 
+            mmap=True
+        )
+    
+    # Load config and create model
+    config_data = load_config_hf(pretrained_model_name)
+    args = ModelArgs(
+        d_model=config_data['d_model'],
+        n_layer=config_data['n_layer'],
+        vocab_size=config_data['vocab_size']
+    )
+    model = Mamba(args)
+    
+    # Load HuggingFace state dict
+    state_dict = load_state_dict_hf(pretrained_model_name)
+    
+    def load_tensor(name):
+        """Pop tensor from state_dict and convert to float."""
+        return state_dict.pop(name).float()
+    
+    # Get model's named parameters for direct assignment
+    model_params = dict(model.named_parameters())
+    
+    # Load embedding weights (tied with lm_head)
+    model_params['embedding.weight'].data.copy_(
+        load_tensor('backbone.embedding.weight')
+    )
+    
+    # Load final norm weights
+    model_params['norm_f.weight'].data.copy_(
+        load_tensor('backbone.norm_f.weight')
+    )
+    
+    # Load each layer
+    for layer_i in range(args.n_layer):
+        prefix = f'backbone.layers.{layer_i}'
+        model_prefix = f'layers.{layer_i}'
+        
+        # MambaBlock in_proj
+        in_proj_weight = load_tensor(f'{prefix}.mixer.in_proj.weight')
+        model_params[f'{model_prefix}.mixer.in_proj.weight'].data.copy_(in_proj_weight)
+        
+        # Check if in_proj has bias (depends on args.bias)
+        if f'{prefix}.mixer.in_proj.bias' in state_dict:
+            in_proj_bias = load_tensor(f'{prefix}.mixer.in_proj.bias')
+            model_params[f'{model_prefix}.mixer.in_proj.bias'].data.copy_(in_proj_bias)
+        
+        # Conv1d weights - HF format is (d_inner, 1, d_conv), we need (d_inner, d_conv)
+        conv_weight = load_tensor(f'{prefix}.mixer.conv1d.weight')
+        model_params[f'{model_prefix}.mixer.conv1d.weight'].data.copy_(
+            conv_weight # Remove middle dimension
+        )
+        model_params[f'{model_prefix}.mixer.conv1d.bias'].data.copy_(
+            load_tensor(f'{prefix}.mixer.conv1d.bias')
+        )
+        
+        # x_proj (projects to dt_rank + 2*d_state)
+        x_proj_weight = load_tensor(f'{prefix}.mixer.x_proj.weight')
+        model_params[f'{model_prefix}.mixer.x_proj.weight'].data.copy_(x_proj_weight)
+        
+        # dt_proj
+        dt_proj_weight = load_tensor(f'{prefix}.mixer.dt_proj.weight')
+        model_params[f'{model_prefix}.mixer.dt_proj.weight'].data.copy_(dt_proj_weight)
+        model_params[f'{model_prefix}.mixer.dt_proj.bias'].data.copy_(
+            load_tensor(f'{prefix}.mixer.dt_proj.bias')
+        )
+        
+        # A_log and D (state space parameters)
+        model_params[f'{model_prefix}.mixer.A_log'].data.copy_(
+            load_tensor(f'{prefix}.mixer.A_log')
+        )
+        model_params[f'{model_prefix}.mixer.D'].data.copy_(
+            load_tensor(f'{prefix}.mixer.D')
+        )
+        
+        # out_proj
+        out_proj_weight = load_tensor(f'{prefix}.mixer.out_proj.weight')
+        model_params[f'{model_prefix}.mixer.out_proj.weight'].data.copy_(out_proj_weight)
+        
+        # Check if out_proj has bias
+        if f'{prefix}.mixer.out_proj.bias' in state_dict:
+            out_proj_bias = load_tensor(f'{prefix}.mixer.out_proj.bias')
+            model_params[f'{model_prefix}.mixer.out_proj.bias'].data.copy_(out_proj_bias)
+        
+        # Layer norm
+        model_params[f'{model_prefix}.norm.weight'].data.copy_(
+            load_tensor(f'{prefix}.norm.weight')
+        )
+    
+    # Check if all weights were loaded
+    if state_dict:
+        print(f"Warning: The following weights were not loaded: {list(state_dict.keys())}")
+    
+    # Move to device if specified
+    if device is not None:
+        model = model.to(device)
+    
+    print(f"✅ Successfully loaded pretrained weights from {pretrained_model_name}")
+    return model
+
+
+# Example usage:
+if __name__ == "__main__":
+    from transformers import AutoTokenizer
+    # Load a pretrained model
+    model = load_pretrained_mamba('state-spaces/mamba-130m')
+    
+    # Test the model
+    batch_size = 2
+    seq_len = 10
+    vocab_size = model.args.vocab_size
+    
+    dummy_input = torch.randint(0, vocab_size, (batch_size, seq_len))
+    
+    with torch.no_grad():
+        logits = model(dummy_input)
+    
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"Output shape: {logits.shape}")
+    print(f"Model device: {next(model.parameters()).device}")
 # %%
-args = ModelArgs(
-    d_model=128,      # embedding dimension
-    n_layer=4,        # number of layers
-    vocab_size=1000,  # vocabulary size
-    d_state=16,       # state dimension for SSM
-    expand=2,         # expansion factor
-    dt_rank="auto",   # automatically set dt_rank
-    d_conv=4,         # convolution kernel size
-    pad_vocab_size_multiple=8,
-    conv_bias=True,
-    bias=True
-)
-
-# Instantiate the Mamba model
-model = Mamba(args)
-
-# Create dummy input: batch_size=2, seq_len=10, with random token indices
-batch_size = 2
-seq_len = 10
-dummy_indices = torch.randint(0, args.vocab_size, (batch_size, seq_len))
-
-# Forward pass
-with torch.no_grad():
-    logits = model.forward(dummy_indices)
-
-print(f"Input shape: {dummy_indices.shape}")
-print(f"Output logits shape: {logits.shape}") 
-# %%
+    def batch_generation_example():
+        """Example of generating multiple tokens."""
+        print("\n🔄 Batch generation example...")
+        
+        # Load tokenizer and model
+        tokenizer = AutoTokenizer.from_pretrained("state-spaces/mamba-2.8b-hf")
+        model = load_pretrained_mamba('state-spaces/mamba-130m')
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device)
+        
+        # Prepare input
+        prompt = "The weather today is very"
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs['input_ids'].to(device)
+        
+        print(f"📝 Prompt: {prompt}")
+        
+        # Generate multiple tokens
+        model.eval()
+        generated_tokens = []
+        
+        with torch.no_grad():
+            for i in range(20):  # Generate 20 tokens
+                logits = model(input_ids)
+                next_token_logits = logits[:, -1, :]
+                
+                # Simple greedy decoding
+                next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                generated_tokens.append(next_token.item())
+                
+                # Append to input for next iteration
+                input_ids = torch.cat([input_ids, next_token], dim=1)
+        
+        # Decode generated text
+        generated_text = tokenizer.decode(generated_tokens)
+        print(f"💬 Generated: {generated_text}")
+        print(f"📄 Full text: {prompt}{generated_text}")
+    batch_generation_example()
