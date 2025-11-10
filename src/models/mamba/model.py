@@ -99,7 +99,7 @@ class MambaBlock(nn.Module):
             args.d_inner, args.d_inner, args.d_conv, bias=args.conv_bias, groups=args.d_inner, padding=args.d_conv - 1
         )
 
-        A = repeat(torch.arange(1, args.d_state + 1), 'n -> d n', d=args.d_inner)
+        A = repeat(torch.arange(1, args.d_state + 1), 'n -> d n', d=args.d_inner) 
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(args.d_inner))
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=args.bias)
@@ -248,16 +248,13 @@ def load_pretrained_mamba(pretrained_model_name: str, device=None):
         load_tensor('backbone.norm_f.weight')
     )
     
-    # Load each layer
     for layer_i in range(args.n_layer):
         prefix = f'backbone.layers.{layer_i}'
         model_prefix = f'layers.{layer_i}'
         
-        # MambaBlock in_proj
         in_proj_weight = load_tensor(f'{prefix}.mixer.in_proj.weight')
         model_params[f'{model_prefix}.mixer.in_proj.weight'].data.copy_(in_proj_weight)
         
-        # Check if in_proj has bias (depends on args.bias)
         if f'{prefix}.mixer.in_proj.bias' in state_dict:
             in_proj_bias = load_tensor(f'{prefix}.mixer.in_proj.bias')
             model_params[f'{model_prefix}.mixer.in_proj.bias'].data.copy_(in_proj_bias)
