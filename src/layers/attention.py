@@ -3,7 +3,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from .normalization import LayerNorm
+from normalization import LayerNorm
 from typing import Tuple
 
 class DotProductAttention(nn.Module):
@@ -75,10 +75,17 @@ class GroupedQueryRotaryAttention(nn.Module):
         k, v = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.n_kv_heads), kv)
 
         if self.apply_rotary_embedding:
-            if rotation_matr is None:
-                rotation_matr = self.compute_rotation_matrix()
-
+            seqlen = q.shape[2]
             offset = self.get_kv_cache_seqlen() if use_kv_cache else 0
+            total_seqlen = seqlen + offset
+            
+            if rotation_matr is None:
+                rotation_matr = self.compute_rotation_matrix(total_seqlen, q.device)
+            else:
+                cos_A, sin_A = rotation_matr
+                if cos_A.shape[0] < total_seqlen:
+                    rotation_matr = self.compute_rotation_matrix(total_seqlen, q.device)
+
             q = self.apply_rotation_matrix(q, rotation_matr, offset)
             k = self.apply_rotation_matrix(k, rotation_matr, offset )
 
@@ -104,10 +111,10 @@ class GroupedQueryRotaryAttention(nn.Module):
         out = self.to_out(attn_output)
         return out
 
-    def compute_rotation_matrix(self):
+    def compute_rotation_matrix(self, seqlen: int, device):
         angle = torch.outer(
-            torch.arange(self.max_seqlen),
-            1. / self.rotary_base ** (2 * torch.arange(self.dim_head // 2) / self.dim_head)
+            torch.arange(seqlen, device=device),
+            1. / self.rotary_base ** (2 * torch.arange(self.dim_head // 2, device=device) / self.dim_head)
         )
         cos_A = torch.stack([angle.cos(), angle.cos()], dim=2)
         sin_A = torch.stack([-angle.sin(), angle.sin()], dim=2)
@@ -180,37 +187,37 @@ attention = GroupedQueryRotaryAttention(
 )
 
 # Prepare input tensor (batch_size, seq_len, embed_dim)
-# batch_size = 2
-# seq_len = 64
-# x = torch.randn(batch_size, seq_len, embed_dim)
+batch_size = 2
+seq_len = 64
+x = torch.randn(batch_size, seq_len, embed_dim)
 
-# # Set to eval mode for KV cache usage
-# attention.eval()
+# Set to eval mode for KV cache usage
+attention.eval()
 
-# # Forward pass without KV cache
-# output_no_cache = attention(x)
+# Forward pass without KV cache
+output_no_cache = attention(x)
 
-# print(f"Output shape without KV cache: {output_no_cache.shape}")
+print(f"Output shape without KV cache: {output_no_cache.shape}")
 
-# # Forward pass with KV cache (simulate incremental generation)
-# attention.clear_kv_cache()  # Ensure cache is cleared
+# Forward pass with KV cache (simulate incremental generation)
+attention.clear_kv_cache()  # Ensure cache is cleared
 
-# # First chunk
-# x_chunk1 = x[:, :32, :]  # First 32 tokens
-# output_chunk1 = attention(x_chunk1, use_kv_cache=True)
+# First chunk
+x_chunk1 = x[:, :32, :]  # First 32 tokens
+output_chunk1 = attention(x_chunk1, use_kv_cache=True)
 
-# print(f"Output shape for chunk 1: {output_chunk1.shape}")
-# print(f"KV cache sequence length after chunk 1: {attention.get_kv_cache_seqlen()}")
+print(f"Output shape for chunk 1: {output_chunk1.shape}")
+print(f"KV cache sequence length after chunk 1: {attention.get_kv_cache_seqlen()}")
 
-# # Second chunk (continuing from cache)
-# x_chunk2 = x[:, 32:64, :]  # Next 32 tokens
-# output_chunk2 = attention(x_chunk2, use_kv_cache=True)
+# Second chunk (continuing from cache)
+x_chunk2 = x[:, 32:64, :]  # Next 32 tokens
+output_chunk2 = attention(x_chunk2, use_kv_cache=True)
 
-# print(f"Output shape for chunk 2: {output_chunk2.shape}")
-# print(f"KV cache sequence length after chunk 2: {attention.get_kv_cache_seqlen()}")
+print(f"Output shape for chunk 2: {output_chunk2.shape}")
+print(f"KV cache sequence length after chunk 2: {attention.get_kv_cache_seqlen()}")
 
-# # Clear cache when done
-# attention.clear_kv_cache()
+# Clear cache when done
+attention.clear_kv_cache()
 
 #%%
 
