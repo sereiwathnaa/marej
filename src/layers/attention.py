@@ -3,7 +3,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from normalization import LayerNorm
+from .normalization import LayerNorm
 from typing import Tuple
 
 class DotProductAttention(nn.Module):
@@ -56,7 +56,9 @@ class GroupedQueryRotaryAttention(nn.Module):
         self.apply_rotary_embedding = apply_rotary_embedding
         self.rotary_base = rotary_base
         self.max_seqlen = max_seqlen
-        self.dim_head = embed_dim // n_heads  
+        self.dim_head = embed_dim // n_heads
+
+        self.kv_cache: Tuple[Tensor, Tensor] = None
 
         self.attention = DotProductAttention(use_flash=use_flash, dropout_p=dropout_p)
         self.to_q = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -75,16 +77,13 @@ class GroupedQueryRotaryAttention(nn.Module):
         k, v = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.n_kv_heads), kv)
 
         if self.apply_rotary_embedding:
-            seqlen = q.shape[2]
             offset = self.get_kv_cache_seqlen() if use_kv_cache else 0
-            total_seqlen = seqlen + offset
+            seqlen = q.shape[2]
             
             if rotation_matr is None:
-                rotation_matr = self.compute_rotation_matrix(total_seqlen, q.device)
-            else:
-                cos_A, sin_A = rotation_matr
-                if cos_A.shape[0] < total_seqlen:
-                    rotation_matr = self.compute_rotation_matrix(total_seqlen, q.device)
+                # Need enough rotation positions for offset + current sequence
+                max_pos = max(offset + seqlen, self.max_seqlen)
+                rotation_matr = self._compute_rotation_matrix(max_pos, q.device)
 
             q = self.apply_rotation_matrix(q, rotation_matr, offset)
             k = self.apply_rotation_matrix(k, rotation_matr, offset )
@@ -111,10 +110,17 @@ class GroupedQueryRotaryAttention(nn.Module):
         out = self.to_out(attn_output)
         return out
 
-    def compute_rotation_matrix(self, seqlen: int, device):
+    def compute_rotation_matrix(self):
+        """Compute rotation matrix for the max sequence length."""
+        return self._compute_rotation_matrix(self.max_seqlen, None)
+    
+    def _compute_rotation_matrix(self, seqlen: int, device):
+        """Internal method to compute rotation matrix for any sequence length."""
+        if device is None:
+            device = 'cpu'
         angle = torch.outer(
             torch.arange(seqlen, device=device),
-            1. / self.rotary_base ** (2 * torch.arange(self.dim_head // 2, device=device) / self.dim_head)
+            (1. / self.rotary_base ** (2 * torch.arange(self.dim_head // 2, device=device) / self.dim_head))
         )
         cos_A = torch.stack([angle.cos(), angle.cos()], dim=2)
         sin_A = torch.stack([-angle.sin(), angle.sin()], dim=2)

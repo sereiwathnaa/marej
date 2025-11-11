@@ -6,6 +6,6 @@ srcopy/
 /out-shakespeare-bpe
 *.github
 /docs
-CHANGES.md
 vault
 *.md
+*example.py
