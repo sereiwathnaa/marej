@@ -3,9 +3,9 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from .normalization import LayerNorm
+from normalization import LayerNorm
 from typing import Tuple
-
+#%%
 class DotProductAttention(nn.Module):
     def __init__(self, use_flash: bool=True, dropout_p: float=0.):
         super().__init__()
@@ -193,37 +193,37 @@ attention = GroupedQueryRotaryAttention(
 )
 
 # Prepare input tensor (batch_size, seq_len, embed_dim)
-batch_size = 2
-seq_len = 64
-x = torch.randn(batch_size, seq_len, embed_dim)
+# batch_size = 2
+# seq_len = 64
+# x = torch.randn(batch_size, seq_len, embed_dim)
 
-# Set to eval mode for KV cache usage
-attention.eval()
+# # Set to eval mode for KV cache usage
+# attention.eval()
 
-# Forward pass without KV cache
-output_no_cache = attention(x)
+# # Forward pass without KV cache
+# output_no_cache = attention(x)
 
-print(f"Output shape without KV cache: {output_no_cache.shape}")
+# print(f"Output shape without KV cache: {output_no_cache.shape}")
 
-# Forward pass with KV cache (simulate incremental generation)
-attention.clear_kv_cache()  # Ensure cache is cleared
+# # Forward pass with KV cache (simulate incremental generation)
+# attention.clear_kv_cache()  # Ensure cache is cleared
 
-# First chunk
-x_chunk1 = x[:, :32, :]  # First 32 tokens
-output_chunk1 = attention(x_chunk1, use_kv_cache=True)
+# # First chunk
+# x_chunk1 = x[:, :32, :]  # First 32 tokens
+# output_chunk1 = attention(x_chunk1, use_kv_cache=True)
 
-print(f"Output shape for chunk 1: {output_chunk1.shape}")
-print(f"KV cache sequence length after chunk 1: {attention.get_kv_cache_seqlen()}")
+# print(f"Output shape for chunk 1: {output_chunk1.shape}")
+# print(f"KV cache sequence length after chunk 1: {attention.get_kv_cache_seqlen()}")
 
-# Second chunk (continuing from cache)
-x_chunk2 = x[:, 32:64, :]  # Next 32 tokens
-output_chunk2 = attention(x_chunk2, use_kv_cache=True)
+# # Second chunk (continuing from cache)
+# x_chunk2 = x[:, 32:64, :]  # Next 32 tokens
+# output_chunk2 = attention(x_chunk2, use_kv_cache=True)
 
-print(f"Output shape for chunk 2: {output_chunk2.shape}")
-print(f"KV cache sequence length after chunk 2: {attention.get_kv_cache_seqlen()}")
+# print(f"Output shape for chunk 2: {output_chunk2.shape}")
+# print(f"KV cache sequence length after chunk 2: {attention.get_kv_cache_seqlen()}")
 
-# Clear cache when done
-attention.clear_kv_cache()
+# # Clear cache when done
+# attention.clear_kv_cache()
 
 #%%
 
@@ -342,4 +342,58 @@ class DotProductAttention(nn.Module):
 # print(y_flash.sum(), y_no_flash.sum())
 # # %%
 
+# %%
+class FixedSparseAttention(nn.Module):
+    def __init__(self,
+                 embed_dim: int=512,
+                 n_heads: int=8,
+                 dim_head: int=64,
+                 block_size: int=8,
+                 use_flash: bool=True):
+        super().__init__()
+        # assert embed_dim % n_heads == 0
+        inner_dim = dim_head * n_heads
+        self.block_size = block_size
+        self.norm = LayerNorm(embed_dim)
+        self.to_qkv = nn.Linear(embed_dim, inner_dim * 3)
+        self.to_out = nn.Linear(inner_dim, embed_dim)
+        self.use_flash = hasattr(F, "scaled_dot_product_attention") and use_flash
+
+    def forward(self, x: Tensor):
+        b, seqlen, _ = x.shape
+        
+        # Handle padding if sequence length is not divisible by block size
+
+            
+        padded_seqlen = x.shape[1]
+        num_blocks = padded_seqlen // self.block_size
+        
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        # Rearrange to (batch, num_blocks, block_size, dim)
+        query, key, value = map(lambda t: rearrange(t, "b (nb bs) d -> b nb bs d", nb=num_blocks, bs=self.block_size), qkv)
+
+        # Causal mask for within-block attention
+        # 1 (True) means mask out (future positions)
+        attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).triu(1)
+
+        if self.use_flash:
+            # scaled_dot_product_attention expects (batch, heads, seqlen, dim)
+            # We treat blocks as heads for parallel computation
+            out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask.logical_not(), is_causal=False)
+            print(out)
+        else:
+            scale = query.shape[-1] ** -0.5
+            # Use single-letter subscripts for einsum: b=batch, n=num_blocks, i/j=block_size, d=dim
+            logits = torch.einsum("b n i d, b n j d -> b n i j", query, key) * scale
+            logits.masked_fill_(attn_mask, value=-1e9)
+            attn = F.softmax(logits, dim=-1)
+            print(logits)
+            out = torch.einsum("b n i j, b n j d -> b n i d", attn, value)
+        
+        out = rearrange(out, "b nb bs d -> b (nb bs) d")
+        
+
+            
+        out = self.to_out(out)
+        return out
 # %%
