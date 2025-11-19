@@ -386,7 +386,4 @@ class DotProductAttention(Module):
         
         return (attn_output, attn_scores)
         
-        
-    def __repr__(self):
-        return f'DotProductAttention(dropout={self.dropout.p})'
 
