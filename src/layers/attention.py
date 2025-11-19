@@ -374,14 +374,12 @@ class FixedSparseAttention(nn.Module):
 
         # Causal mask for within-block attention
         # 1 (True) means mask out (future positions)
-        print(self.block_size)
         attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).triu(1)
 
         if self.use_flash:
             # scaled_dot_product_attention expects (batch, heads, seqlen, dim)
             # We treat blocks as heads for parallel computation
             out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask.logical_not(), is_causal=False)
-            print(out)
         else:
             scale = query.shape[-1] ** -0.5
             # Use single-letter subscripts for einsum: b=batch, n=num_blocks, i/j=block_size, d=dim
@@ -392,9 +390,6 @@ class FixedSparseAttention(nn.Module):
             out = torch.einsum("b n i j, b n j d -> b n i d", attn, value)
         
         out = rearrange(out, "b nb bs d -> b (nb bs) d")
-        
-
-            
         out = self.to_out(out)
         return out
 # %%
