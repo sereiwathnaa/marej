@@ -374,6 +374,7 @@ class FixedSparseAttention(nn.Module):
 
         # Causal mask for within-block attention
         # 1 (True) means mask out (future positions)
+        print(self.block_size)
         attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).triu(1)
 
         if self.use_flash:
