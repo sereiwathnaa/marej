@@ -362,28 +362,15 @@ class FixedSparseAttention(nn.Module):
     def forward(self, x: Tensor):
         b, seqlen, _ = x.shape
         
-        # Handle padding if sequence length is not divisible by block size
-
-            
-        padded_seqlen = x.shape[1]
-        num_blocks = padded_seqlen // self.block_size
+        num_blocks =  seqlen // self.block_size
         
         qkv = self.to_qkv(x).chunk(3, dim=-1)
-        # Rearrange to (batch, num_blocks, block_size, dim)
         query, key, value = map(lambda t: rearrange(t, "b (nb bs) d -> b nb bs d", nb=num_blocks, bs=self.block_size), qkv)
-
-        # Causal mask for within-block attention
-        # 1 (True) means mask out (future positions)
         attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).triu(1)
-
         if self.use_flash:
-            # scaled_dot_product_attention expects (batch, heads, seqlen, dim)
-            # We treat blocks as heads for parallel computation
             out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask.logical_not(), is_causal=False)
         else:
-            scale = query.shape[-1] ** -0.5
-            # Use single-letter subscripts for einsum: b=batch, n=num_blocks, i/j=block_size, d=dim
-            logits = torch.einsum("b n i d, b n j d -> b n i j", query, key) * scale
+            logits = torch.einsum("b n i d, b n j d -> b n i j", query, key) * query.shape[-1] ** -0.5
             logits.masked_fill_(attn_mask, value=-1e9)
             attn = F.softmax(logits, dim=-1)
             print(logits)
@@ -392,4 +379,54 @@ class FixedSparseAttention(nn.Module):
         out = rearrange(out, "b nb bs d -> b (nb bs) d")
         out = self.to_out(out)
         return out
-# %%
+#%%
+class StridedSparseAttention(nn.Module):
+    def __init__(self,
+                 embed_dim: int=512,
+                 n_heads: int=8,
+                 dim_head: int=64,
+                 block_size: int=8):
+        super().__init__()
+        inner_dim = dim_head * n_heads
+        self.block_size = block_size
+        self.norm = LayerNorm(embed_dim)
+        self.to_qkv = nn.Linear(embed_dim, inner_dim * 3)
+        self.to_out = nn.Linear(inner_dim, embed_dim)
+        self.use_flash = hasattr(F, "scaled_dot_product_attention") & use_flash
+
+    def forward(self,
+                x: Tensor):
+        b, seqlen, _ = x.shape
+        num_blocks = seqlen // self.block_size
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, "b (nb bs) d -> b nb bs d", nb=num_blocks, bs=self.block_size), qkv)
+        q_prev = q[:, 1:]
+        k_prev = q[:, :-1]
+        v_prev = v[:, :-1]
+
+        # attend to current subblock
+        logits = q @ k.transpose(-1, -2) * q.shape[-1] ** -0.5
+        causal_attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).triu(1)
+        logits = torch.masked_fill(logits, mask=causal_attn_mask, value=-1e9)
+        
+        # attend to  previous subblock
+        # (batch, num_blocks - 1, block_size, block_size)
+        logits_prev = q_prev @ k_prev.transpose(-1, -2) * q.shape[-1] ** -0.5
+
+        prev_attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).tril(0)
+        logits_prev = torch.masked_fill(logits_prev, mask=prev_attn_mask, value=-1e9)
+
+        padding_neginf = torch.ones((b, 1, self.block_size, self.block_size), device=x.device) * -1e9
+        # (batch, num_blocks, block_size, block_size)
+        logits_prev = torch.cat([padding_neginf, logits_prev], dim=1)
+
+        # (batch, num_blocks, block_size, block_size * 2)
+        logits_prev_and_curr = torch.cat([logits_prev, logits], dim=-1)
+        attn = F.softmax(logits_prev_and_curr, dim=-1)
+        (attn_prev, attn) = attn.chunk(2, dim=-1)
+        attn_output = attn @ v
+        attn_output_prev = attn_prev[:, 1:] @ v_prev
+
+        attn_output[:, 1:] += attn_output_prev
+        attn_output = rearrange(attn_output, "b nb bs d -> b (nb bs) d")
+        return attn_output
