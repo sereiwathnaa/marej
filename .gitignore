@@ -10,3 +10,6 @@ vault
 *.md
 *example.py
 *.png
+/others
+/data
+*play.ipynb
