@@ -3,7 +3,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from normalization import LayerNorm
+from .normalization import LayerNorm
 from typing import Tuple
 #%%
 class DotProductAttention(nn.Module):

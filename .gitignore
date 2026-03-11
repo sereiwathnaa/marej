@@ -13,3 +13,6 @@ vault
 /others
 /data
 *play.ipynb
+*.vscode
+*.log
+*.txt

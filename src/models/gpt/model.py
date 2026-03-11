@@ -3,7 +3,7 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 import sys
 from dataclasses import dataclass
-sys.path.append("/home/nyxx/my_project/marejv2")
+sys.path.append("../../../")
 from src.layers.normalization import LayerNorm
 from src.layers.attention import MultiheadAttention
 import inspect
