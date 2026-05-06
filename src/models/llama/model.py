@@ -2,7 +2,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 import sys
-sys.path.append("/home/nyxx/my_project/marejv2/")
+sys.path.append("../../../")
 from src.layers.attention import GroupedQueryRotaryAttention
 from src.layers.normalization import RMSNorm
 from typing import Tuple
@@ -41,7 +41,8 @@ class DecoderBlock(nn.Module):
         self.attn = GroupedQueryRotaryAttention(
             embed_dim, n_heads, n_kv_heads,
             dropout_p=0., apply_rotary_embedding=True,
-            max_seqlen=block_size, bias=False, use_flash=True,
+            rotary_base=rotary_base, max_seqlen=block_size,
+            bias=False, use_flash=use_flash,
             batch_first=True
         )
         self.norm2 = RMSNorm(embed_dim, eps=norm_eps)
@@ -60,7 +61,7 @@ class DecoderBlock(nn.Module):
                   use_kv_cache: bool,
                   rotation_matr: Tuple[Tensor, Tensor]=None):
         causal_attn_mask = torch.ones((x.shape[1], x.shape[1]), device=x.device).triu(1)
-        out = self.attn(x, x, x, causal_attn_mask, use_kv_cache, rotation_matr)
+        out = self.attn(x, causal_attn_mask, use_kv_cache, rotation_matr)
         return out
 
 
@@ -114,6 +115,8 @@ class Llama(nn.Module):
     def forward(self,
                 indices: Tensor,
                 use_kv_cache: bool=False):
+        if self.rotation_matr[0].device != indices.device:
+            self.rotation_matr = tuple(t.to(indices.device) for t in self.rotation_matr)
         x = self.word_embeddings(indices)
         for decoder_block in self.decoder_blocks:
             x = decoder_block(x, use_kv_cache, self.rotation_matr)
@@ -126,8 +129,65 @@ class Llama(nn.Module):
     @staticmethod
     def from_pretrained(model_name: str,
                         model_dir: str):
-        from transformers import AutoModelForCausalLModel
-        pass
+        model_hf = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=model_dir)
+        config_hf = model_hf.config
+
+        config = {
+            "n_layers": config_hf.num_hidden_layers,
+            "n_heads": config_hf.num_attention_heads,
+            "embed_dim": config_hf.hidden_size,
+            "vocab_size": config_hf.vocab_size,
+            "block_size": config_hf.max_position_embeddings,
+            "n_kv_heads": config_hf.num_key_value_heads,
+            "ffn_hidden_dim": config_hf.intermediate_size,
+            "rotary_base": getattr(config_hf, "rope_theta", 10000),
+            "norm_eps": config_hf.rms_norm_eps,
+            "use_flash": True,
+        }
+
+        model = Llama(**config)
+
+        sd_hf = model_hf.state_dict()
+        sd = model.state_dict()
+
+        sd["word_embeddings.weight"].copy_(sd_hf["model.embed_tokens.weight"])
+        sd["output_projection.weight"].copy_(sd_hf["lm_head.weight"])
+        sd["rms_norm.weight"].copy_(sd_hf["model.norm.weight"])
+
+        for i in range(config["n_layers"]):
+            prefix = f"model.layers.{i}"
+            block_prefix = f"decoder_blocks.{i}"
+
+            sd[f"{block_prefix}.norm1.weight"].copy_(
+                sd_hf[f"{prefix}.input_layernorm.weight"]
+            )
+            sd[f"{block_prefix}.norm2.weight"].copy_(
+                sd_hf[f"{prefix}.post_attention_layernorm.weight"]
+            )
+
+            sd[f"{block_prefix}.attn.to_q.weight"].copy_(
+                sd_hf[f"{prefix}.self_attn.q_proj.weight"]
+            )
+
+            k_weight = sd_hf[f"{prefix}.self_attn.k_proj.weight"]
+            v_weight = sd_hf[f"{prefix}.self_attn.v_proj.weight"]
+            sd[f"{block_prefix}.attn.to_kv.weight"].copy_(torch.cat([k_weight, v_weight], dim=0))
+
+            sd[f"{block_prefix}.attn.to_out.weight"].copy_(
+                sd_hf[f"{prefix}.self_attn.o_proj.weight"]
+            )
+
+            sd[f"{block_prefix}.ffn.linear1.weight"].copy_(
+                sd_hf[f"{prefix}.mlp.gate_proj.weight"]
+            )
+            sd[f"{block_prefix}.ffn.linear2.weight"].copy_(
+                sd_hf[f"{prefix}.mlp.down_proj.weight"]
+            )
+            sd[f"{block_prefix}.ffn.linear3.weight"].copy_(
+                sd_hf[f"{prefix}.mlp.up_proj.weight"]
+            )
+
+        return model
 
 
 # model = Llama(

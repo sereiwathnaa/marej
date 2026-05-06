@@ -62,12 +62,10 @@ class RMSNorm(nn.Module):
         
         
     def forward(self, x):
-        # Calculate RMS along the specified axis
-        # Using torch.mean with dim parameter
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
         rms_sq = torch.mean(x ** 2, dim=self.axis, keepdim=True)
-        
-        # Normalize and scale
-        x_normalized = x / torch.sqrt(rms_sq + self.eps)
-        x_normalized = x_normalized * self.weight
+        x_normalized = x * torch.rsqrt(rms_sq + self.eps)
+        x_normalized = x_normalized.to(input_dtype) * self.weight
 
         return x_normalized

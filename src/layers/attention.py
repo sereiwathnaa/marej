@@ -3,7 +3,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from .normalization import LayerNorm
+from .normalization import LayerNorm, RMSNorm
 from typing import Tuple
 
 class DotProductAttention(nn.Module):
@@ -45,7 +45,8 @@ class GroupedQueryRotaryAttention(nn.Module):
                  max_seqlen: int=4096,
                  bias: bool=True,
                  use_flash: bool=True,
-                 batch_first: bool=True):
+                 batch_first: bool=True,
+                 qk_norm=False):
         super().__init__()
         assert embed_dim % n_heads == 0
         assert n_heads % n_kv_heads == 0
@@ -57,13 +58,16 @@ class GroupedQueryRotaryAttention(nn.Module):
         self.rotary_base = rotary_base
         self.max_seqlen = max_seqlen
         self.dim_head = embed_dim // n_heads
-
         self.kv_cache: Tuple[Tensor, Tensor] = None
 
         self.attention = DotProductAttention(use_flash=use_flash, dropout_p=dropout_p)
         self.to_q = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.to_kv = nn.Linear(embed_dim, n_kv_heads * self.dim_head * 2, bias=bias)
         self.to_out = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        if qk_norm:
+            self.q_norm = RMSNorm
+
     
     def forward(self,
                  x: Tensor,
@@ -118,13 +122,13 @@ class GroupedQueryRotaryAttention(nn.Module):
         """Internal method to compute rotation matrix for any sequence length."""
         if device is None:
             device = 'cpu'
-        angle = torch.outer(
-            torch.arange(seqlen, device=device),
-            (1. / self.rotary_base ** (2 * torch.arange(self.dim_head // 2, device=device) / self.dim_head))
+        positions = torch.arange(seqlen, device=device, dtype=torch.float32)
+        inv_freq = 1.0 / (
+            self.rotary_base ** (2 * torch.arange(self.dim_head // 2, device=device, dtype=torch.float32) / self.dim_head)
         )
-        cos_A = torch.stack([angle.cos(), angle.cos()], dim=2)
-        sin_A = torch.stack([-angle.sin(), angle.sin()], dim=2)
-        rotation_matr = (cos_A, sin_A)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        rotation_matr = (emb.cos(), emb.sin())
         return rotation_matr
 
     def apply_rotation_matrix(self,
@@ -137,10 +141,10 @@ class GroupedQueryRotaryAttention(nn.Module):
         """
         (cos_A, sin_A) = rotation_matr
         seqlen = qk.shape[2]
-        qk = rearrange(qk, "... (d j) -> ... d j", j=2)
-        qk_rotated = (cos_A[offset:offset+seqlen] * qk
-                      + sin_A[offset:offset+seqlen] * torch.flip(qk, dims=[-1]))
-        qk_rotated = rearrange(qk_rotated, "... d j -> ... (d j)")
+        cos_A = cos_A[offset:offset+seqlen].to(dtype=qk.dtype, device=qk.device)
+        sin_A = sin_A[offset:offset+seqlen].to(dtype=qk.dtype, device=qk.device)
+        qk_half = torch.cat((-qk[..., qk.shape[-1] // 2:], qk[..., :qk.shape[-1] // 2]), dim=-1)
+        qk_rotated = qk * cos_A.unsqueeze(0).unsqueeze(0) + qk_half * sin_A.unsqueeze(0).unsqueeze(0)
         return qk_rotated
 
     def get_kv_cache_seqlen(self):
