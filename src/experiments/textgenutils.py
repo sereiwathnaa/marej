@@ -7,7 +7,9 @@ import numpy as np
 from typing import Dict
 from IPython.display import clear_output
 import torch
-
+import sys
+sys.path.append("../../")
+import src.nlp.chattemplates as chattemplates
 import torch.nn.functional as F
 
 def interactive_conversation(model,
@@ -91,7 +93,7 @@ def generate_text(model,
                   n_tokens_to_gen: int,
                   top_k: int = 40,
                   top_p: int = 0.95,
-                  temperature: float = 1.0,
+                  temperature: float = 0.8,
                   sample: bool = True,
                   stop_token_idx: int = None,
                   stop_strings: Dict[str, int] = None,

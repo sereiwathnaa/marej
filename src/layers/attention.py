@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from .normalization import LayerNorm
 from typing import Tuple
-#%%
+
 class DotProductAttention(nn.Module):
     def __init__(self, use_flash: bool=True, dropout_p: float=0.):
         super().__init__()
@@ -33,7 +33,7 @@ class DotProductAttention(nn.Module):
             out = rearrange(out, "b h l d -> b l (h d)")
 
         return out
-#%%
+
 class GroupedQueryRotaryAttention(nn.Module):
     def __init__(self,
                  embed_dim: int,

@@ -149,6 +149,15 @@ def nucleus_sample(probs: torch.Tensor,
     return probs
 
 
+def _get_generation_logits(model,
+                           indices: torch.Tensor,
+                           use_kv_cache: bool):
+    outputs = model(indices, use_kv_cache=use_kv_cache)
+    if isinstance(outputs, tuple):
+        return outputs[0]
+    return outputs
+
+
 # def batch_generation(model, 
 #                      indices: torch.Tensor,
 #                      n_tokens_to_gen: int,
@@ -318,20 +327,29 @@ def beam_search_generation(model,
                            temperature: float=1.,
                            sample: bool=True,
                            use_kv_cache: bool=True,
-                           modify_kv_cache_func: callable=None):
+                           modify_kv_cache_func: Callable=None):
     model.eval()
 
-    device = next(model.parameters()).device
+    if indices.ndim != 2:
+        raise ValueError("indices must have shape (batch, seqlen).")
+    if indices.shape[0] != 1:
+        raise ValueError("beam_search_generation only supports batch size 1.")
+    if n_tokens_to_gen <= 0:
+        return
 
     if modify_kv_cache_func is None:
         modify_kv_cache_func = default_modify_kv_cache
     if beam_size is None:
         beam_size = 1
-    if use_kv_cache:
-        final_kv_cache_len = model.get_kv_cache_seqlen() + len(indices)
+    if beam_size < 1:
+        raise ValueError("beam_size must be at least 1.")
+
+    prompt_len = indices.shape[1]
+    device = indices.device
+    initial_kv_cache_len = model.get_kv_cache_seqlen() if use_kv_cache else 0
     
-    cumulative_log_prob_per_beam = torch.Tensor([0.0])
-    head_index = indices.shape[1]
+    cumulative_log_prob_per_beam = torch.zeros(indices.shape[0], device=device)
+    head_index = prompt_len
 
     for token_n in range(n_tokens_to_gen):
         if indices.shape[1] >= model.block_size:
@@ -341,66 +359,77 @@ def beam_search_generation(model,
             if use_kv_cache:
                 if token_n > 0:
                     indices_to_input = indices_to_input[:, -1:]
-            next_token_logits = model(indices_to_input, use_kv_cache)[:, -1]
-        probs = F.softmax(next_token_logits / temperature, dim=0).T
+            next_token_logits = _get_generation_logits(model, indices_to_input, use_kv_cache=use_kv_cache)[:, -1]
+        probs = F.softmax(next_token_logits / (temperature + 1e-6), dim=-1).T
 
         if top_k is not None:
             probs = top_k_sample(probs, top_k)
         if top_p is not None:
             probs = nucleus_sample(probs, top_p)
         
-        probs += 1.0e-3 / len(probs)
-        log_probs = torch.log(probs) + cumulative_log_prob_per_beam
+        token_log_probs = torch.full_like(probs, float("-inf"))
+        positive_probs = probs > 0
+        token_log_probs[positive_probs] = torch.log(probs[positive_probs])
+
+        log_probs = token_log_probs + cumulative_log_prob_per_beam.unsqueeze(0)
+        flat_log_probs = log_probs.flatten()
+        current_beam_size = min(beam_size, int(positive_probs.sum().item()))
 
         if sample:
-            normalized_probs = F.softmax(log_probs.flatten())
-            next_beam_indices = torch.multinomial(normalized_probs, beam_size, replacement=False)
+            normalized_probs = F.softmax(flat_log_probs, dim=0)
+            next_beam_indices = torch.multinomial(normalized_probs, current_beam_size, replacement=False)
         else:
-            next_beam_indices = log_probs.flatten().argsort(descending=True)[-beam_size:]
+            next_beam_indices = torch.topk(flat_log_probs, k=current_beam_size).indices
 
-        cumulative_log_prob_per_beam = log_probs.flatten()[next_beam_indices]
-        new_indices = torch.zeros((beam_size, indices.shape[1] + 1), dtype=torch.long, device=device)
+        cumulative_log_prob_per_beam = flat_log_probs[next_beam_indices]
+        n_parent_beams = indices.shape[0]
+        new_indices = torch.empty((current_beam_size, indices.shape[1] + 1), dtype=torch.long, device=device)
         reindex_kv_indices = []
         for (i, beam_index) in enumerate(next_beam_indices):
-            next_index = beam_index // indices.shape[0]
-            indices_i = beam_index % indices.shape[0]
-        
-            new_indices[i] = torch.cat([indices[indices_i], torch.tensor([next_index], dtype=torch.long, device=device)], dim=0)
-            reindex_kv_indices.append(indices_i)
-        indices = torch.Tensor(new_indices)
+            beam_index = beam_index.item()
+            next_index = beam_index // n_parent_beams
+            parent_beam_index = beam_index % n_parent_beams
+
+            new_indices[i, :-1] = indices[parent_beam_index]
+            new_indices[i, -1] = next_index
+            reindex_kv_indices.append(parent_beam_index)
+        indices = new_indices
 
         if use_kv_cache:
             modify_kv_cache_func(model, reindex_kv_indices=reindex_kv_indices)
-        indices_at_head = indices[:, head_index]
-        while torch.unique(indices_at_head).numel() == 1:
+        while head_index < indices.shape[1] and torch.all(indices[:, head_index] == indices[0, head_index]):
             try:
+                next_index = int(indices[0, head_index])
                 head_index += 1
-                yield [int(indices_at_head[0])]
+                yield [next_index]
             except GeneratorExit:
                 if use_kv_cache:
-                    modify_kv_cache_func(model,
-                                         trim_seqlen=final_kv_cache_len,
-                                         reindex_kv_indices=[0])
+                    if head_index == indices.shape[1]:
+                        modify_kv_cache_func(model, reindex_kv_indices=[0])
+                        _ = _get_generation_logits(model, indices[0:1, head_index - 1:head_index], use_kv_cache=True)
+                    else:
+                        modify_kv_cache_func(model,
+                                             trim_seqlen=initial_kv_cache_len + head_index,
+                                             reindex_kv_indices=[0])
                 return
-            
-            if head_index == indices.shape[1]:
-                break
-            
-            indices_at_head = indices[:, head_index]
     
     if sample:
         best_index = torch.multinomial(F.softmax(cumulative_log_prob_per_beam, dim=0), 1).item()
     else:
         best_index = cumulative_log_prob_per_beam.argmax().item()
     
-    if use_kv_cache:
-        modify_kv_cache_func(model, trim_seqlen=final_kv_cache_len,
-                             reindex_kv_indices=[best_index])
-    yield indices[best_index, head_index:].long().tolist()
+    if use_kv_cache and indices.shape[1] > prompt_len:
+        modify_kv_cache_func(model, reindex_kv_indices=[best_index])
+        _ = _get_generation_logits(model, indices[best_index:best_index + 1, -1:], use_kv_cache=True)
+
+    remaining_indices = indices[best_index, head_index:].long().tolist()
+    if remaining_indices:
+        yield remaining_indices
+
 
 def default_modify_kv_cache(model,
                             trim_seqlen: int=None,
-                            reindex_batch_indices: list[int]=None):
+                            reindex_kv_indices: list[int]=None):
     for decoder_block in model.decoder_blocks:
         if decoder_block.attn.kv_cache is not None:
             (key_cache, value_cache) = decoder_block.attn.kv_cache
@@ -412,7 +441,7 @@ def default_modify_kv_cache(model,
                 else:
                     key_cache = None
                     value_cache = None
-            if reindex_batch_indices:
-                key_cache = key_cache.data[reindex_batch_indices]
-                value_cache = value_cache.data[reindex_batch_indices]
+            if reindex_kv_indices is not None and key_cache is not None:
+                key_cache = key_cache[reindex_kv_indices]
+                value_cache = value_cache[reindex_kv_indices]
             decoder_block.attn.kv_cache = (key_cache, value_cache)
