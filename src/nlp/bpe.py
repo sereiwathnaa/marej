@@ -1,6 +1,5 @@
 """Byte-Pair Encoding tokenization."""
 
-import torch
 from typing import List, Tuple, Dict
 
 
@@ -42,17 +41,13 @@ def tokenize(word: str,
 
     # Keep merging token pairs in word_tokens based on `merges` until we can't merge anymore
     while len(word_tokens) > 1:
-        token_pairs = list(zip(word_tokens, word_tokens[1:]))
-
-        merge_order_values = torch.tensor([merge_order.get(pair, float('inf')) for pair in token_pairs])
-        min_index = torch.argmin(merge_order_values)
-        highest_priority_pair = token_pairs[min_index.item()]
-        if highest_priority_pair not in merges: 
+        token_pairs = zip(word_tokens, word_tokens[1:])
+        highest_priority_pair = min(token_pairs, key=lambda pair: merge_order.get(pair, float('inf')))
+        if highest_priority_pair not in merge_order:
             # This means that no pair in token_pairs appear in `merges`, so we're done
             break
 
         # Merge all occurrences of highest_priority_pair in word_tokens
-        
         word_tokens = merge_tokens(word_tokens, highest_priority_pair)
         if verbose:
             print(f'Merged {highest_priority_pair}. word_tokens = {word_tokens}')

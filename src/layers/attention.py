@@ -1,4 +1,3 @@
-#%%
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -6,35 +5,47 @@ from einops import rearrange, repeat
 from .normalization import LayerNorm, RMSNorm
 from typing import Tuple
 
+
 class DotProductAttention(nn.Module):
+    """Scaled dot-product attention over (batch, heads, seqlen, dim_head) tensors.
+
+    attn_mask: (query seqlen, key seqlen); nonzero/True = NOT allowed to attend.
+    Returns (batch, seqlen, heads * dim_head).
+    """
+
     def __init__(self, use_flash: bool=True, dropout_p: float=0.):
         super().__init__()
         self.dropout = dropout_p
         self.use_flash = use_flash
-    
+
     def forward(self,
                 query: Tensor,
                 key: Tensor,
                 value: Tensor,
                 attn_mask: Tensor=None):
+        dropout_p = self.dropout if self.training else 0.
         if self.use_flash:
             if attn_mask is not None:
-                out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask.bool().logical_not(), dropout_p=self.dropout if self.training else 0.)
+                out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask.bool().logical_not(), dropout_p=dropout_p)
             else:
-                out = F.scaled_dot_product_attention(query, key, value, dropout_p=self.dropout if self.training else 0., is_causal=False)
-            out = rearrange(out, "b h l d -> b l (h d)")
+                out = F.scaled_dot_product_attention(query, key, value, dropout_p=dropout_p, is_causal=False)
         else:
             logits = torch.einsum("b h i d, b h j d -> b h i j", query, key) * query.shape[-1] ** -0.5
             if attn_mask is not None:
                 logits = logits.masked_fill(attn_mask.bool(), value=-1e9)
             attn = F.softmax(logits, dim=-1)
-            attn = F.dropout(attn, self.dropout)
+            attn = F.dropout(attn, self.dropout, training=self.training)
             out = torch.einsum("b h i j, b h j d -> b h i d", attn, value)
-            out = rearrange(out, "b h l d -> b l (h d)")
 
-        return out
+        return rearrange(out, "b h l d -> b l (h d)")
+
 
 class GroupedQueryRotaryAttention(nn.Module):
+    """Grouped-query attention with optional rotary embedding (rotate-half convention) and KV cache.
+
+    MultiheadAttention == GroupedQueryRotaryAttention(n_kv_heads=n_heads, apply_rotary_embedding=False).
+    """
+
     def __init__(self,
                  embed_dim: int,
                  n_heads: int,
@@ -46,7 +57,7 @@ class GroupedQueryRotaryAttention(nn.Module):
                  bias: bool=True,
                  use_flash: bool=True,
                  batch_first: bool=True,
-                 qk_norm=False):
+                 qk_norm: bool=False):
         super().__init__()
         assert embed_dim % n_heads == 0
         assert n_heads % n_kv_heads == 0
@@ -65,10 +76,10 @@ class GroupedQueryRotaryAttention(nn.Module):
         self.to_kv = nn.Linear(embed_dim, n_kv_heads * self.dim_head * 2, bias=bias)
         self.to_out = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-        if qk_norm:
-            self.q_norm = RMSNorm
+        # Per-head RMSNorm on q and k before rotary embedding (Qwen3-style)
+        self.q_norm = RMSNorm(self.dim_head) if qk_norm else None
+        self.k_norm = RMSNorm(self.dim_head) if qk_norm else None
 
-    
     def forward(self,
                  x: Tensor,
                  attn_mask: Tensor=None,
@@ -80,21 +91,25 @@ class GroupedQueryRotaryAttention(nn.Module):
         kv = self.to_kv(x).chunk(2, dim=-1)
         k, v = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.n_kv_heads), kv)
 
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         if self.apply_rotary_embedding:
             offset = self.get_kv_cache_seqlen() if use_kv_cache else 0
             seqlen = q.shape[2]
-            
+
             if rotation_matr is None:
                 # Need enough rotation positions for offset + current sequence
                 max_pos = max(offset + seqlen, self.max_seqlen)
                 rotation_matr = self._compute_rotation_matrix(max_pos, q.device)
 
             q = self.apply_rotation_matrix(q, rotation_matr, offset)
-            k = self.apply_rotation_matrix(k, rotation_matr, offset )
+            k = self.apply_rotation_matrix(k, rotation_matr, offset)
 
         if use_kv_cache:
             if self.training:
-                raise RuntimeError("GroupQueryRotaryAttention must be in .eval() mode if using KV caching")
+                raise RuntimeError("GroupedQueryRotaryAttention must be in .eval() mode if using KV caching")
             if self.kv_cache is not None:
                 k_cache, v_cache = self.kv_cache
                 k = torch.cat([k_cache, k], dim=2)
@@ -107,9 +122,9 @@ class GroupedQueryRotaryAttention(nn.Module):
             self.kv_cache = (k.detach(), v.detach())
 
         if self.n_heads != self.n_kv_heads:
-            k = repeat(k, "b kv_h l d -> b (kv_h rep) l d", rep=self.n_heads//self.n_kv_heads)
-            v = repeat(v, 'b kv_h l d -> b (kv_h rep) l d', rep=self.n_heads//self.n_kv_heads)
-        
+            k = repeat(k, "b kv_h l d -> b (kv_h rep) l d", rep=self.n_heads // self.n_kv_heads)
+            v = repeat(v, "b kv_h l d -> b (kv_h rep) l d", rep=self.n_heads // self.n_kv_heads)
+
         attn_output = self.attention(q, k, v, attn_mask)
         out = self.to_out(attn_output)
         return out
@@ -117,7 +132,7 @@ class GroupedQueryRotaryAttention(nn.Module):
     def compute_rotation_matrix(self):
         """Compute rotation matrix for the max sequence length."""
         return self._compute_rotation_matrix(self.max_seqlen, None)
-    
+
     def _compute_rotation_matrix(self, seqlen: int, device):
         """Internal method to compute rotation matrix for any sequence length."""
         if device is None:
@@ -154,82 +169,16 @@ class GroupedQueryRotaryAttention(nn.Module):
         else:
             # kv_cache[0] and [1] are shape (batch, n_heads, cache_seqlen, per_head_dim)
             return self.kv_cache[0].shape[2]
-    
-    
+
     def clear_kv_cache(self):
         """Clears kv_cache."""
         self.kv_cache = None
-        
-        
+
     def __repr__(self):
         return (f'GroupedQueryRotaryAttention(embed_dim={self.embed_dim}, '
                 f'n_heads={self.n_heads}, n_kv_heads={self.n_kv_heads}, '
-                f'apply_rotary_embedding={self.apply_rotary_embedding})')    
+                f'apply_rotary_embedding={self.apply_rotary_embedding})')
 
-#%%
-import torch
-import torch.nn as nn
-
-# Example configuration for GroupedQueryRotaryAttention
-embed_dim = 1024
-n_heads = 16
-n_kv_heads = 4  # Grouped query attention with fewer KV heads
-dropout_p = 0.1
-apply_rotary_embedding = True
-rotary_base = 10000
-max_seqlen = 1024
-bias = True
-use_flash = True
-batch_first = True
-
-# Instantiate the attention module
-attention = GroupedQueryRotaryAttention(
-    embed_dim=embed_dim,
-    n_heads=n_heads,
-    n_kv_heads=n_kv_heads,
-    dropout_p=dropout_p,
-    apply_rotary_embedding=apply_rotary_embedding,
-    rotary_base=rotary_base,
-    max_seqlen=max_seqlen,
-    bias=bias,
-    use_flash=use_flash,
-    batch_first=batch_first
-)
-
-# Prepare input tensor (batch_size, seq_len, embed_dim)
-# batch_size = 2
-# seq_len = 64
-# x = torch.randn(batch_size, seq_len, embed_dim)
-
-# # Set to eval mode for KV cache usage
-# attention.eval()
-
-# # Forward pass without KV cache
-# output_no_cache = attention(x)
-
-# print(f"Output shape without KV cache: {output_no_cache.shape}")
-
-# # Forward pass with KV cache (simulate incremental generation)
-# attention.clear_kv_cache()  # Ensure cache is cleared
-
-# # First chunk
-# x_chunk1 = x[:, :32, :]  # First 32 tokens
-# output_chunk1 = attention(x_chunk1, use_kv_cache=True)
-
-# print(f"Output shape for chunk 1: {output_chunk1.shape}")
-# print(f"KV cache sequence length after chunk 1: {attention.get_kv_cache_seqlen()}")
-
-# # Second chunk (continuing from cache)
-# x_chunk2 = x[:, 32:64, :]  # Next 32 tokens
-# output_chunk2 = attention(x_chunk2, use_kv_cache=True)
-
-# print(f"Output shape for chunk 2: {output_chunk2.shape}")
-# print(f"KV cache sequence length after chunk 2: {attention.get_kv_cache_seqlen()}")
-
-# # Clear cache when done
-# attention.clear_kv_cache()
-
-#%%
 
 class MultiheadAttention(nn.Module):
     def __init__(self,
@@ -245,19 +194,20 @@ class MultiheadAttention(nn.Module):
         inner_dim = dim_head * n_heads
         self.embed_dim = embed_dim
         self.n_heads = n_heads
+        # Unused in forward; kept so existing checkpoints (which contain attn.norm.*) still load.
         self.norm = LayerNorm(embed_dim)
-        self.to_qkv = nn.Linear(inner_dim, inner_dim * 3, bias=bias)
-        self.to_out = nn.Linear(inner_dim, embed_dim, bias=bias)       
+        self.to_qkv = nn.Linear(embed_dim, inner_dim * 3, bias=bias)
+        self.to_out = nn.Linear(inner_dim, embed_dim, bias=bias)
 
         self.kv_cache: Tuple[torch.Tensor] = None
-        self.use_flash = hasattr(F, "scaled_dot_product_attention") & use_flash
+        self.use_flash = hasattr(F, "scaled_dot_product_attention") and use_flash
         self.attn = DotProductAttention(self.use_flash, dropout_p=dropout_p)
-    
+
     def forward(self,
                 x: Tensor,
                 attn_mask: Tensor=None,
                 use_kv_cache: bool=False):
-        
+
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         query, key, value = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.n_heads), qkv)
 
@@ -272,7 +222,7 @@ class MultiheadAttention(nn.Module):
                 if attn_mask is not None:
                     cache_attn_mask = torch.zeros((len(attn_mask), self.get_kv_cache_seqlen()), dtype=attn_mask.dtype, device=attn_mask.device)
                     attn_mask = torch.cat([cache_attn_mask, attn_mask], dim=1)
-            
+
             self.kv_cache = (key.detach(), value.detach())
 
         attn_output = self.attn(query, key, value, attn_mask)
@@ -284,7 +234,7 @@ class MultiheadAttention(nn.Module):
             return 0
         else:
             return self.kv_cache[0].shape[2]
-        
+
     def clear_kv_cache(self):
         self.kv_cache = None
 
@@ -292,62 +242,14 @@ class MultiheadAttention(nn.Module):
         return (f'MultiheadAttention(embed_dim={self.embed_dim}, '
                 f'n_heads={self.n_heads})')
 
-#%%
-class DotProductAttention(nn.Module):
-    def __init__(self, use_flash: bool=True, dropout_p: float=0.):
-        super().__init__()
-        self.dropout = dropout_p
-        self.use_flash = use_flash
-    
-    def forward(self,
-                query: Tensor,
-                key: Tensor,
-                value: Tensor,
-                attn_mask: Tensor=None):
-        if self.use_flash:
-            if attn_mask is not None:
-                out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask.bool().logical_not(), dropout_p=self.dropout if self.training else 0.)
-            else:
-                out = F.scaled_dot_product_attention(query, key, value, dropout_p=self.dropout if self.training else 0., is_causal=False)
-            out = rearrange(out, "b h l d -> b l (h d)")
-        else:
-            logits = torch.einsum("b h i d, b h j d -> b h i j", query, key) * query.shape[-1] ** -0.5
-            if attn_mask is not None:
-                logits = logits.masked_fill(attn_mask.bool(), value=-1e9)
-            attn = F.softmax(logits, dim=-1)
-            attn = F.dropout(attn, self.dropout)
-            out = torch.einsum("b h i j, b h j d -> b h i d", attn, value)
-            out = rearrange(out, "b h l d -> b l (h d)")
 
-        return out
-
-#%%
-# torch.manual_seed(0)
-# batch, seq_len, embed = 2, 16, 512
-# x = torch.randn(batch, seq_len, embed)
-
-# attn_flash = MultiheadAttention(embed_dim=embed, n_heads=8, dim_head=64, dropout_p=0.0, use_flash=True)
-# attn_no_flash = MultiheadAttention(embed_dim=embed, n_heads=8, dim_head=64, dropout_p=0.0, use_flash=False)
-# attn_no_flash.load_state_dict(attn_flash.state_dict())
-
-# attn_flash.eval()
-# attn_no_flash.eval()
-
-# y_flash = attn_flash(x)
-# y_no_flash = attn_no_flash(x)
-# print("no mask diff:", (y_flash - y_no_flash).abs().max().item())
-
-# mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
-# y_flash_mask = attn_flash(x, attn_mask=mask)
-# y_no_flash_mask = attn_no_flash(x, attn_mask=mask)
-# print("causal mask diff:", (y_flash_mask - y_no_flash_mask).abs().max().item())
-# # %%
-# print((y_flash_mask.sum(), y_no_flash_mask.sum()))
-# print(y_flash.sum(), y_no_flash.sum())
-# # %%
-
-# %%
 class FixedSparseAttention(nn.Module):
+    """Block-local causal attention: each block of `block_size` tokens attends only within itself.
+
+    Note: heads are not split; attention runs single-headed over inner_dim = dim_head * n_heads.
+    seqlen must be divisible by block_size.
+    """
+
     def __init__(self,
                  embed_dim: int=512,
                  n_heads: int=8,
@@ -355,19 +257,16 @@ class FixedSparseAttention(nn.Module):
                  block_size: int=8,
                  use_flash: bool=True):
         super().__init__()
-        # assert embed_dim % n_heads == 0
         inner_dim = dim_head * n_heads
         self.block_size = block_size
-        self.norm = LayerNorm(embed_dim)
         self.to_qkv = nn.Linear(embed_dim, inner_dim * 3)
         self.to_out = nn.Linear(inner_dim, embed_dim)
         self.use_flash = hasattr(F, "scaled_dot_product_attention") and use_flash
 
     def forward(self, x: Tensor):
         b, seqlen, _ = x.shape
-        
-        num_blocks =  seqlen // self.block_size
-        
+        num_blocks = seqlen // self.block_size
+
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         query, key, value = map(lambda t: rearrange(t, "b (nb bs) d -> b nb bs d", nb=num_blocks, bs=self.block_size), qkv)
         attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).triu(1)
@@ -377,14 +276,20 @@ class FixedSparseAttention(nn.Module):
             logits = torch.einsum("b n i d, b n j d -> b n i j", query, key) * query.shape[-1] ** -0.5
             logits.masked_fill_(attn_mask, value=-1e9)
             attn = F.softmax(logits, dim=-1)
-            print(logits)
             out = torch.einsum("b n i j, b n j d -> b n i d", attn, value)
-        
+
         out = rearrange(out, "b nb bs d -> b (nb bs) d")
         out = self.to_out(out)
         return out
-#%%
+
+
 class StridedSparseAttention(nn.Module):
+    """Block-local causal attention plus full attention to the previous block.
+
+    Note: heads are not split; attention runs single-headed over inner_dim = dim_head * n_heads.
+    seqlen must be divisible by block_size.
+    """
+
     def __init__(self,
                  embed_dim: int=512,
                  n_heads: int=8,
@@ -393,10 +298,8 @@ class StridedSparseAttention(nn.Module):
         super().__init__()
         inner_dim = dim_head * n_heads
         self.block_size = block_size
-        self.norm = LayerNorm(embed_dim)
         self.to_qkv = nn.Linear(embed_dim, inner_dim * 3)
         self.to_out = nn.Linear(inner_dim, embed_dim)
-        self.use_flash = hasattr(F, "scaled_dot_product_attention") & use_flash
 
     def forward(self,
                 x: Tensor):
@@ -405,22 +308,23 @@ class StridedSparseAttention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, "b (nb bs) d -> b nb bs d", nb=num_blocks, bs=self.block_size), qkv)
         q_prev = q[:, 1:]
-        k_prev = q[:, :-1]
+        k_prev = k[:, :-1]
         v_prev = v[:, :-1]
 
         # attend to current subblock
         logits = q @ k.transpose(-1, -2) * q.shape[-1] ** -0.5
         causal_attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).triu(1)
         logits = torch.masked_fill(logits, mask=causal_attn_mask, value=-1e9)
-        
-        # attend to  previous subblock
+
+        # attend to previous subblock
         # (batch, num_blocks - 1, block_size, block_size)
         logits_prev = q_prev @ k_prev.transpose(-1, -2) * q.shape[-1] ** -0.5
 
         prev_attn_mask = torch.ones((self.block_size, self.block_size), device=x.device, dtype=torch.bool).tril(0)
         logits_prev = torch.masked_fill(logits_prev, mask=prev_attn_mask, value=-1e9)
 
-        padding_neginf = torch.ones((b, 1, self.block_size, self.block_size), device=x.device) * -1e9
+        # first block has no previous block
+        padding_neginf = torch.full_like(logits[:, :1], -1e9)
         # (batch, num_blocks, block_size, block_size)
         logits_prev = torch.cat([padding_neginf, logits_prev], dim=1)
 
@@ -433,4 +337,4 @@ class StridedSparseAttention(nn.Module):
 
         attn_output[:, 1:] += attn_output_prev
         attn_output = rearrange(attn_output, "b nb bs d -> b (nb bs) d")
-        return attn_output
+        return self.to_out(attn_output)

@@ -96,7 +96,7 @@ def test_strided_sparse_attention():
     print(f"Input shape: {x.shape}")
     
     print("\nRunning StridedSparseAttention...")
-    device = "cuda" 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using {device}")
     model = model.to(device)
     x = x.to(device)

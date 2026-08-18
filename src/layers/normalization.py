@@ -29,28 +29,25 @@ class ScratchLayerNorm(nn.Module):
         
         self.dim = tuple(dim)
         self.axis = tuple([-i for i in range(1, 1+len(dim))])
-        self.eps = 1e-5
+        self.eps = eps
 
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim)) if bias else 0
 
     def forward(self, x):
-        mean = x.mean(axis=self.axis, keepdims=True)
-        var = x.var(axis=self.axis, keepdims=True)
+        mean = x.mean(dim=self.axis, keepdim=True)
+        var = x.var(dim=self.axis, unbiased=False, keepdim=True)  # biased, like F.layer_norm
         x_normalized = (x - mean) / (var + self.eps) ** 0.5
         x_normalized = x_normalized * self.weight + self.bias
 
         return x_normalized
 
 class RMSNorm(nn.Module):
-    
     def __init__(self,
-                 normalized_shape: Union[int, Tuple[int]], 
-                 axis: Union[int, Tuple[int]] = None,
+                 normalized_shape: Union[int, Tuple[int]],
                  eps: float = 1e-5):
-
         super().__init__()
-        
+
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
             
@@ -59,8 +56,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
         self.weight = nn.Parameter(torch.ones(normalized_shape))
-        
-        
+
     def forward(self, x):
         input_dtype = x.dtype
         x = x.to(torch.float32)

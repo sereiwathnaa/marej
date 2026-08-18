@@ -78,7 +78,7 @@ def test_sparse_attention():
     
     # Configuration
     batch_size = 2
-    seq_len = 32 # Not divisible by block_size=8
+    seq_len = 32 # Must be divisible by block_size=8
     embed_dim = 64
     n_heads = 4
     dim_head = 16

@@ -1,16 +1,18 @@
-
-#%%
 from __future__ import annotations
+import os
+import sys
+import math
+import json
+from dataclasses import dataclass
+from typing import Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat, einsum
-import math
-from dataclasses import dataclass
 
-from typing import Union
-import sys
-sys.path.append("/home/nyxx/my_project/marejv2/")
+# project root, so `from src...` works whether run as a script, notebook, or module
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from src.layers.normalization import RMSNorm
 
 @dataclass
@@ -174,12 +176,6 @@ class MambaBlock(nn.Module):
         y = y + u * D
 
         return y
-    
-
-#%%
-import json
-from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
-from transformers.utils.hub import cached_file
 
 
 def load_pretrained_mamba(pretrained_model_name: str, device=None):
@@ -197,7 +193,10 @@ def load_pretrained_mamba(pretrained_model_name: str, device=None):
                         
     Returns:
         model: Mamba model with pretrained weights loaded
-    """    
+    """
+    from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+    from transformers.utils.hub import cached_file
+
     def load_config_hf(model_name):
         resolved_archive_file = cached_file(
             model_name, 
@@ -259,10 +258,9 @@ def load_pretrained_mamba(pretrained_model_name: str, device=None):
             in_proj_bias = load_tensor(f'{prefix}.mixer.in_proj.bias')
             model_params[f'{model_prefix}.mixer.in_proj.bias'].data.copy_(in_proj_bias)
         
-        # Conv1d weights - HF format is (d_inner, 1, d_conv), we need (d_inner, d_conv)
-        conv_weight = load_tensor(f'{prefix}.mixer.conv1d.weight')
+        # Conv1d weights: HF and our depthwise nn.Conv1d both use (d_inner, 1, d_conv)
         model_params[f'{model_prefix}.mixer.conv1d.weight'].data.copy_(
-            conv_weight # Remove middle dimension
+            load_tensor(f'{prefix}.mixer.conv1d.weight')
         )
         model_params[f'{model_prefix}.mixer.conv1d.bias'].data.copy_(
             load_tensor(f'{prefix}.mixer.conv1d.bias')
@@ -332,7 +330,7 @@ if __name__ == "__main__":
     print(f"Input shape: {dummy_input.shape}")
     print(f"Output shape: {logits.shape}")
     print(f"Model device: {next(model.parameters()).device}")
-# %%
+
     def batch_generation_example():
         """Example of generating multiple tokens."""
         print("\n🔄 Batch generation example...")

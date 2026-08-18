@@ -1,11 +1,16 @@
+import os
+import sys
+import math
+
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from typing import Tuple
 from einops import repeat
+
+# project root, so `from src...` works whether run as a script, notebook, or module
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from src.layers.attention import GroupedQueryRotaryAttention
 from src.layers.normalization import RMSNorm
-import math
 
 
 class Mixtral(nn.Module):
@@ -92,8 +97,7 @@ class Mixtral(nn.Module):
             # Initialization, Huang et al. 2020" you want the gradient norm to be independent of depth. There are 2 "updates"
             # to the residual stream per layer (one from attn and one from FFN), and so you want each update to have variance
             # proportional to 1/(2*n_layers) to keep total variance independent of depth.
-            if name.endswith('attn.to_out.weight') or name.endswith('linear3.weight'):
-                print(name)
+            if name.endswith('attn.to_out.weight') or name.endswith('linear2.weight'):
                 nn.init.normal_(params[name], std=0.02 / math.sqrt(2 * self.n_layers))
 
 class DecoderBlock(nn.Module):

@@ -2,8 +2,8 @@
 This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
+Run from anywhere; config files are resolved relative to the current directory:
+$ python src/models/gpt/train.py config/train_shakespeare_char.py --batch_size=32 --compile=False
 
 To run with DDP on 4 gpus on 1 node, example:
 $ torchrun --standalone --nproc_per_node=4 train.py
@@ -22,12 +22,16 @@ import math
 import pickle
 from contextlib import nullcontext
 
+import sys
 import numpy as np
 import torch
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from .model import GPTConfig, GPT
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.abspath(os.path.join(_script_dir, '..', '..', '..'))
+sys.path.append(_project_root)
+from src.models.gpt.model import GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -86,7 +90,7 @@ else:
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
+exec(open(os.path.join(_project_root, 'configurator.py')).read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -122,13 +126,10 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if device.startswith('cuda') else ('mps' if device == 'mps' else 'cpu')
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type not in {'cuda', 'mps'} else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ctx = nullcontext() if dtype == 'float32' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-# Construct path relative to this script's location
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.join(script_dir, '../../..')
-data_dir = os.path.join(project_root, 'data', dataset)
+data_dir = os.path.join(_project_root, 'data', dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -194,15 +195,11 @@ elif init_from == 'resume':
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout_p)
-    model = GPT.from_pretrained(init_from, override_args)
+    model = GPT.from_pretrained(init_from, dropout_p=dropout_p)
     # read off the created config params, so we can store them into checkpoint correctly
-    model_args['n_layers'] = model.config.n_layers
-    model_args['n_heads'] = model.config.n_heads
-    model_args['embed_dim'] = model.config.embed_dim
-    model_args['block_size'] = model.config.block_size
-    model_args['bias'] = model.config.bias
-    model_args['vocab_size'] = model.config.vocab_size
+    for k in ['n_layers', 'n_heads', 'embed_dim', 'block_size', 'vocab_size']:
+        model_args[k] = getattr(model, k)
+    model_args['bias'] = True # GPT-2 always has biases
 # crop down the model block size if desired, using model surgery
 # if block_size < model.block_size:
 #     model.crop_block_size(block_size)
@@ -218,10 +215,11 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
+raw_model = model # unwrapped model, for checkpoints and mfu; compile/DDP share its parameters
+
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
 # wrap model into DDP container
@@ -267,7 +265,6 @@ if wandb_log and master_process:
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 model.train()
 while True:

@@ -213,18 +213,24 @@ class Processor:
                 lowest_score_pair.right_pair.invalid = True
                 heapq.heappush(token_pairs, right)
         
-        if len(token_pairs) > 0:
+        # Only live pairs have correct linked-list pointers; invalidated copies remain in the heap
+        # (with score inf) but their pointers are stale.
+        live_pairs = [p for p in token_pairs if not p.invalid]
+        if len(live_pairs) > 0:
             # Find leftmost pair
-            pair = token_pairs[0]
+            pair = live_pairs[0]
             while pair.left_pair is not None:
                 pair = pair.left_pair
-            
+
             # Iterate through linked list, collecting the token strings
             merged_tokens = [pair.left_token, pair.right_token]
             while pair.right_pair is not None:
                 pair = pair.right_pair
                 merged_tokens.append(pair.right_token)
-        
+
+        elif len(input_str) == 1:  # No pairs at all
+            merged_tokens = [input_str]
+
         else:  # This means everything was merged into one token == `lowest_score_pair`
             merged_tokens = [lowest_score_pair.left_token + lowest_score_pair.right_token]
         

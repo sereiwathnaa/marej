@@ -1,4 +1,5 @@
 import os
+import pickle
 import requests
 import tiktoken
 import numpy as np
@@ -28,6 +29,14 @@ train_ids = np.array(train_ids, dtype=np.uint16)
 val_ids = np.array(val_ids, dtype=np.uint16)
 train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
 val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
+
+# save the meta information as well: train.py reads vocab_size from here
+meta = {
+    'vocab_size': enc.n_vocab,
+    'tokenizer_type': 'gpt2_bpe',
+}
+with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
+    pickle.dump(meta, f)
 
 # train.bin has 301,966 tokens
 # val.bin has 36,059 tokens

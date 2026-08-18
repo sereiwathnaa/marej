@@ -1,12 +1,16 @@
+import os
+import sys
+import inspect
+from dataclasses import dataclass
+
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-import sys
-from dataclasses import dataclass
-sys.path.append("../../../")
+
+# project root, so `from src...` works whether run as a script, notebook, or module
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from src.layers.normalization import LayerNorm
 from src.layers.attention import MultiheadAttention
-import inspect
 
 @dataclass
 class GPTConfig:
@@ -46,12 +50,14 @@ class GPT(nn.Module):
         )
 
         self.layer_norm = LayerNorm(embed_dim, bias=bias)
-        self.kv_cache: tuple[Tensor] = None
+        # weight tying: the LM head reuses the token embedding matrix
         self.output_projection = self.word_embeddings.weight
+
+        self.apply(self._init_weights)
 
     def forward(self,
                 indices: Tensor,
-                use_kv_cache: bool=True,
+                use_kv_cache: bool=False,
                 targets: Tensor=None,
                 ):
         offset = self.get_kv_cache_seqlen() if use_kv_cache else 0
@@ -97,7 +103,7 @@ class GPT(nn.Module):
         return idx
 
     @staticmethod
-    def from_pretrained(model_name: str):
+    def from_pretrained(model_name: str, dropout_p: float=None):
         from transformers import GPT2LMHeadModel
         model_names = ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"]
         if model_name not in model_names:
@@ -111,7 +117,7 @@ class GPT(nn.Module):
             'embed_dim': model_hf.transformer.h[0].attn.embed_dim,
             'vocab_size': model_hf.lm_head.out_features,
             'block_size': model_hf.transformer.wpe.num_embeddings,
-            'dropout_p': model_hf.transformer.drop.p
+            'dropout_p': model_hf.transformer.drop.p if dropout_p is None else dropout_p,
         }
 
         model = GPT(**config)
@@ -260,10 +266,10 @@ class DecoderBlock(nn.Module):
     
     def forward(self,
                 x: Tensor,
-                use_kv_cache: bool=True):
+                use_kv_cache: bool=False):
         causal_attn_mask = torch.triu(torch.ones(x.shape[1], x.shape[1], device=x.device), diagonal=1)
-        x = x + self.attn(self.ln1(x), causal_attn_mask, use_kv_cache)
-        x = x + self.ffn(self.ln2(x))
+        x = x + self.dropout(self.attn(self.ln1(x), causal_attn_mask, use_kv_cache))
+        x = x + self.dropout(self.ffn(self.ln2(x)))
         return x
 
 class FeedForwardBlock(nn.Module):
@@ -280,5 +286,3 @@ class FeedForwardBlock(nn.Module):
         x = F.gelu(x)
         x = self.linear2(x)
         return x
-    
-# model = GPT.from_pretrained("gpt2")

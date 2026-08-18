@@ -1,12 +1,15 @@
+import os
+import sys
+from typing import Tuple
+
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-import sys
-sys.path.append("../../../")
+
+# project root, so `from src...` works whether run as a script, notebook, or module
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from src.layers.attention import GroupedQueryRotaryAttention
 from src.layers.normalization import RMSNorm
-from typing import Tuple
-from transformers import AutoModelForCausalLM
 
 class FeedForwardBlock(nn.Module):
     def __init__(self,
@@ -128,7 +131,8 @@ class Llama(nn.Module):
 
     @staticmethod
     def from_pretrained(model_name: str,
-                        model_dir: str):
+                        model_dir: str=None):
+        from transformers import AutoModelForCausalLM
         model_hf = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=model_dir)
         config_hf = model_hf.config
 
@@ -189,14 +193,3 @@ class Llama(nn.Module):
 
         return model
 
-
-# model = Llama(
-#     n_layers=6,
-#     n_heads=32,
-#     embed_dim=4096,
-#     vocab_size=32000,
-#     block_size=2048,
-#     n_kv_heads=None,
-#     ffn_hidden_dim=None,
-#     use_flash=True
-# ).cuda()

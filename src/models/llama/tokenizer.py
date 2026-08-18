@@ -1,13 +1,11 @@
 import re
 from typing import List
-import src
 from src.nlp.tokenizer import Tokenizer
+from src.nlp.sentencepiece.processor import Processor
 
 class LlamaTokenizer(Tokenizer):
     def __init__(self, tokenizer_model_path: str):
-
-        self.sp_model = src.nlp.sentencepiece.Processor(tokenizer_model_path)
-
+        self.sp_model = Processor(tokenizer_model_path)
 
     def encode(self, text: str):
         """Encodes text into list of integers.
