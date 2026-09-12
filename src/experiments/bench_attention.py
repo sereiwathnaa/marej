@@ -142,6 +142,10 @@ def sample(model, use_kv_cache):
     return decode(toks)
 
 
+# optional CLI filter: python bench_attention.py Kimi rotary   -> only variants whose name contains one of these
+if len(sys.argv) > 1:
+    VARIANTS = {n: f for n, f in VARIANTS.items() if any(a.lower() in n.lower() for a in sys.argv[1:])}
+
 results = {}
 for name, make_attn in VARIANTS.items():
     print(f"\n=== {name} ===", flush=True)

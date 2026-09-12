@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .normalization import RMSNorm, l2norm
+from .deltaattention_triton import HAS_TRITON, intra_chunk_scores, intra_chunk_scores_torch
 
 
 class GatedDeltaRule(nn.Module):
@@ -39,14 +40,16 @@ class GatedDeltaRule(nn.Module):
 
     use_chunk=True runs the chunkwise-parallel algorithm (sequential only over chunks); otherwise a
     token-by-token recurrence is used. Both paths compute in float32 and are numerically equivalent.
-    Note: the chunk path materialises a (b, h, seqlen, chunk_size, d_k) tensor of pairwise decays,
-    so memory grows with chunk_size.
+    With use_triton=True (default, CUDA only) the intra-chunk scores are computed by the fused Triton
+    kernels in `deltaattention_triton.py`; the PyTorch fallback materialises a
+    (b, h, seqlen, chunk_size, d_k) tensor of pairwise decays, so its memory grows with chunk_size.
     """
 
-    def __init__(self, use_chunk: bool=True, chunk_size: int=64):
+    def __init__(self, use_chunk: bool=True, chunk_size: int=64, use_triton: bool=True):
         super().__init__()
         self.use_chunk = use_chunk
         self.chunk_size = chunk_size
+        self.use_triton = use_triton and HAS_TRITON
 
     def forward(self,
                 query: Tensor,
@@ -110,16 +113,14 @@ class GatedDeltaRule(nn.Module):
         n_chunks = q.shape[2]
 
         g = g.cumsum(dim=-2)  # log G_i: cumulative log-decay from the start of the chunk (<= 0)
-        mask_incl = torch.ones((C, C), dtype=torch.bool, device=q.device).tril(0)
-        mask_strict = mask_incl.tril(-1)
 
-        # Pairwise per-channel decay ratios G_i / G_j for j <= i, shape (b h n C C d_k).
-        # Masked entries are set to -inf before exp so large positive differences never overflow.
-        pair_decay = (g.unsqueeze(-2) - g.unsqueeze(-3)).masked_fill(~mask_incl[:, :, None], float("-inf")).exp()
-        k_decayed = pair_decay * k.unsqueeze(-3)                                    # [i, j] = (G_i / G_j) k_j
-        P = torch.einsum("b h n i d, b h n i j d -> b h n i j", q, k_decayed)        # intra-chunk q-k scores
-        A = torch.einsum("b h n i d, b h n i j d -> b h n i j", k * beta[..., None], k_decayed)
-        A = A.masked_fill(~mask_strict, 0.)
+        # Intra-chunk decayed scores S[i, j] = x_i^T (G_i / G_j) y_j, lower-triangular:
+        #   P (j <= i): q against k      A (j < i): beta k against k
+        scores = intra_chunk_scores if (self.use_triton and q.is_cuda) else intra_chunk_scores_torch
+        flat = lambda t: rearrange(t, "b h n c d -> (b h n) c d")
+        k_flat, g_flat = flat(k), flat(g)
+        P = rearrange(scores(flat(q), k_flat, g_flat, False), "(b h n) i j -> b h n i j", b=b, h=h)
+        A = rearrange(scores(flat(k * beta[..., None]), k_flat, g_flat, True), "(b h n) i j -> b h n i j", b=b, h=h)
 
         # (I + A) is unit lower-triangular: solve for u_tilde = (I+A)^{-1} (beta v) and W = (I+A)^{-1} (beta Kbar)
         I_plus_A = A + torch.eye(C, dtype=A.dtype, device=A.device)
@@ -135,11 +136,14 @@ class GatedDeltaRule(nn.Module):
         if state is None:
             state = q.new_zeros(b, h, d_k, d_v)
 
+        # unbind once: slicing inside the loop makes autograd allocate a full-size zero tensor per slice
+        u_tilde, W, q_bar, P, k_end_T, decay_end = (
+            t.unbind(dim=2) for t in (u_tilde, W, q_bar, P, k_end.transpose(-1, -2), decay_end.unsqueeze(-1)))
         outs = []
         for i in range(n_chunks):
-            u = u_tilde[:, :, i] - W[:, :, i] @ state
-            outs.append(q_bar[:, :, i] @ state + P[:, :, i] @ u)
-            state = decay_end[:, :, i, :, None] * state + k_end[:, :, i].transpose(-1, -2) @ u
+            u = u_tilde[i] - W[i] @ state
+            outs.append(q_bar[i] @ state + P[i] @ u)
+            state = decay_end[i] * state + k_end_T[i] @ u
 
         out = rearrange(torch.stack(outs, dim=2), "b h n c d -> b h (n c) d")[:, :, :l]
         return out, state
@@ -169,6 +173,7 @@ class KimiDeltaAttention(nn.Module):
                  use_short_conv: bool=True,
                  chunk_size: int=64,
                  use_chunk: bool=True,
+                 use_triton: bool=True,
                  bias: bool=False,
                  norm_eps: float=1e-5,
                  batch_first: bool=True):
@@ -187,7 +192,7 @@ class KimiDeltaAttention(nn.Module):
         self.use_short_conv = use_short_conv
         self.state_cache: Tuple[Tensor, Tensor, Tensor, Tensor, int] = None
 
-        self.delta_rule = GatedDeltaRule(use_chunk=use_chunk, chunk_size=chunk_size)
+        self.delta_rule = GatedDeltaRule(use_chunk=use_chunk, chunk_size=chunk_size, use_triton=use_triton)
         self.to_q = nn.Linear(embed_dim, self.key_dim, bias=bias)
         self.to_k = nn.Linear(embed_dim, self.key_dim, bias=bias)
         self.to_v = nn.Linear(embed_dim, self.value_dim, bias=bias)
@@ -309,17 +314,21 @@ if __name__ == "__main__":
                    torch.rand(b, h, l, device=device))
     state0 = torch.randn(b, h, d_k, d_v, device=device)
     results = {}
-    for use_chunk in (False, True):
+    for name, op in (("recurrent", GatedDeltaRule(use_chunk=False)),
+                     ("chunk-torch", GatedDeltaRule(use_chunk=True, chunk_size=32, use_triton=False)),
+                     ("chunk-triton", GatedDeltaRule(use_chunk=True, chunk_size=32, use_triton=True))):
         inputs = [t.clone().requires_grad_(True) for t in base_inputs]
-        out, final_state = GatedDeltaRule(use_chunk=use_chunk, chunk_size=32)(*inputs, state=state0)
+        out, final_state = op(*inputs, state=state0)
         (out.square().sum() + final_state.square().sum()).backward()
-        results[use_chunk] = (out, final_state, [t.grad for t in inputs])
+        results[name] = (out, final_state, [t.grad for t in inputs])
 
-    (out_r, state_r, grads_r), (out_c, state_c, grads_c) = results[False], results[True]
     rel = lambda a, c: ((a - c).abs().max() / a.abs().max()).item()
-    print(f"chunk vs recurrent | out rel err {rel(out_r, out_c):.2e} "
-          f"| state rel err {rel(state_r, state_c):.2e} "
-          f"| grad rel err {max(rel(a, c) for a, c in zip(grads_r, grads_c)):.2e}")
+    out_r, state_r, grads_r = results["recurrent"]
+    for name in ("chunk-torch", "chunk-triton"):
+        out_c, state_c, grads_c = results[name]
+        print(f"{name} vs recurrent | out rel err {rel(out_r, out_c):.2e} "
+              f"| state rel err {rel(state_r, state_c):.2e} "
+              f"| grad rel err {max(rel(a, c) for a, c in zip(grads_r, grads_c)):.2e}")
 
     layer = KimiDeltaAttention(embed_dim=64, n_heads=4, chunk_size=16).to(device).eval()
     x = torch.randn(b, l, 64, device=device)
