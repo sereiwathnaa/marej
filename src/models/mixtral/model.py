@@ -26,7 +26,8 @@ class Mixtral(nn.Module):
                  ffn_hidden_dim: int,
                  rotary_base: int=1e5,
                  norm_eps: float=1e-5,
-                 use_flash: bool=True):
+                 use_flash: bool=True,
+                 dense_moe: bool=False):
         super().__init__()
         if n_kv_heads is None:
             n_kv_heads = n_heads
@@ -49,7 +50,7 @@ class Mixtral(nn.Module):
         self.word_embeddings = nn.Embedding(vocab_size, embed_dim)
         self.decoder_blocks = nn.ModuleList([
             DecoderBlock(embed_dim, ffn_hidden_dim, n_heads, n_kv_heads, n_experts,
-                         n_experts_per_tok, block_size, rotary_base, norm_eps, use_flash)
+                         n_experts_per_tok, block_size, rotary_base, norm_eps, use_flash, dense_moe)
             for _ in range(n_layers)
         ])
         self.rms_norm = RMSNorm(embed_dim, eps=norm_eps)
@@ -111,7 +112,8 @@ class DecoderBlock(nn.Module):
                  block_size: int,
                  rotary_base: int,
                  norm_eps: float,
-                 use_flash: bool):
+                 use_flash: bool,
+                 dense_moe: bool=False):
         super().__init__()
 
         self.norm1 = RMSNorm(embed_dim, eps=norm_eps)
@@ -119,7 +121,7 @@ class DecoderBlock(nn.Module):
                                                 apply_rotary_embedding=True, rotary_base=rotary_base,
                                                 max_seqlen=block_size, bias=False, use_flash=use_flash)
         self.norm2 = RMSNorm(embed_dim, eps=norm_eps)
-        self.moe = MOE(embed_dim, ffn_hidden_dim, n_experts, n_experts_per_tok)
+        self.moe = MOE(embed_dim, ffn_hidden_dim, n_experts, n_experts_per_tok, dense=dense_moe)
 
     def forward(self,
                 x: Tensor,
@@ -140,17 +142,28 @@ class DecoderBlock(nn.Module):
 
 
 class MOE(nn.Module):
+    """Top-k routed mixture of SwiGLU experts.
+
+    dense=False: each expert runs only on the tokens routed to it (memory-efficient; the masked indexing
+                 needs a host sync per expert).
+    dense=True:  every expert runs on every token and the outputs are combined with the sparse routing
+                 weights (zero for unselected experts). Same result and gradients; no syncs, so it is much
+                 faster for small expert counts, at n_experts / n_experts_per_tok times the expert FLOPs.
+    """
+
     def __init__(self,
                  input_dim: int,
                  ffn_hidden_dim: int,
                  n_experts: int,
-                 n_experts_per_tok: int):
+                 n_experts_per_tok: int,
+                 dense: bool=False):
         super().__init__()
         self.experts = nn.ModuleList(
             [FeedForwardBlock(input_dim, ffn_hidden_dim) for _ in range(n_experts)]
         )
         self.gate = nn.Linear(input_dim, n_experts, bias=False)
         self.n_experts_per_tok = n_experts_per_tok
+        self.dense = dense
     
     def forward(self, x):
         # x : (batch, seqlen, embed_dim)
@@ -158,6 +171,12 @@ class MOE(nn.Module):
 
         (weights, selected_experts) = torch.topk(logits, self.n_experts_per_tok, dim=-1) # (batch, seqlen, n_experts_per_tok)
         weights = F.softmax(weights, dim=-1)
+
+        if self.dense:
+            # scatter the top-k weights into a (batch, seqlen, n_experts) matrix, zero elsewhere
+            full_weights = torch.zeros(logits.shape, dtype=weights.dtype, device=x.device).scatter(-1, selected_experts, weights)
+            expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=-1) # (batch, seqlen, embed_dim, n_experts)
+            return torch.einsum("b l d e, b l e -> b l d", expert_outputs, full_weights.to(expert_outputs.dtype))
 
         x_repeat = repeat(x, "b l d -> b l exps d", exps=self.n_experts_per_tok)
         output = torch.empty_like(x_repeat)
