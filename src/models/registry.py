@@ -18,6 +18,11 @@ def build_model(model_type: str, **args):
         return GPT(n_layers=args['n_layers'], n_heads=args['n_heads'], embed_dim=args['embed_dim'],
                    vocab_size=args['vocab_size'], block_size=args['block_size'],
                    dropout_p=args['dropout_p'], bias=args['bias'])
+    if model_type == 'llama':
+        from src.models.llama.model import Llama
+        return Llama(n_layers=args['n_layers'], n_heads=args['n_heads'], embed_dim=args['embed_dim'],
+                     vocab_size=args['vocab_size'], block_size=args['block_size'],
+                     n_kv_heads=args['n_kv_heads'] or None, ffn_hidden_dim=args['ffn_hidden_dim'] or None)
     raise ValueError(f"unknown model_type {model_type!r}")
 
 
