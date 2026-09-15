@@ -123,34 +123,6 @@ class GPT(nn.Module):
                 sd[ours].copy_(sd_hf[theirs].t() if transpose else sd_hf[theirs])
         return model
 
-    @staticmethod
-    def from_checkpoint(ckpt_path: str, device: str, dropout_p: float=None):
-        """Load a checkpoint written by train.py. Returns (model, checkpoint dict).
-
-        Strips the '_orig_mod.' prefix that torch.compile adds to state dict keys.
-        """
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        model_args = dict(checkpoint['model_args'])
-        if dropout_p is not None:
-            model_args['dropout_p'] = dropout_p
-        model = GPT(**model_args)
-        state_dict = {k.removeprefix('_orig_mod.'): v for k, v in checkpoint['model'].items()}
-        model.load_state_dict(state_dict)
-        return model, checkpoint
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """AdamW with weight decay on matrices/embeddings only (biases and layernorm weights are not decayed)."""
-        params = [p for p in self.parameters() if p.requires_grad]
-        decay_params = [p for p in params if p.dim() >= 2]
-        nodecay_params = [p for p in params if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {sum(p.numel() for p in decay_params):,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {sum(p.numel() for p in nodecay_params):,} parameters")
-        return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=(device_type == 'cuda'))
-
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -163,21 +135,6 @@ class GPT(nn.Module):
             n_params -= self.word_embeddings.weight.numel()
         return n_params
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        L, H, Q, T = self.n_layers, self.n_heads, self.embed_dim//self.n_heads, self.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-    
     def clear_kv_cache(self):
         for decoder_block in self.decoder_blocks:
             decoder_block.attn.clear_kv_cache()

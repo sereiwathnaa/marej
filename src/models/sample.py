@@ -1,19 +1,21 @@
 """
-Sample from a trained model. Run from the project root:
+Sample from a trained model (any model_type saved by train.py). Run from the project root:
 
-$ python src/models/gpt/sample.py --out_dir=out-shakespeare-char --start="ROMEO:"
-$ python src/models/gpt/sample.py --out_dir=out-shakespeare-bpe --tokenizer=gpt2bpe
-$ python src/models/gpt/sample.py --init_from=gpt2 --start="Hello, I'm a language model,"
+$ python src/models/sample.py --out_dir=out-shakespeare-char --start="ROMEO:"
+$ python src/models/sample.py --out_dir=out-shakespeare-char-llama --start="ROMEO:"
+$ python src/models/sample.py --out_dir=out-shakespeare-bpe --tokenizer=gpt2bpe
+$ python src/models/sample.py --init_from=gpt2 --start="Hello, I'm a language model,"
 """
 import os
 import sys
 import pickle
 from contextlib import nullcontext
 import torch
+import torch.nn.functional as F
 
-_project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
+_project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 sys.path.append(_project_root)
-from src.models.gpt.model import GPT
+from src.models.registry import load_checkpoint
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -44,9 +46,9 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 checkpoint = None
 if init_from == 'resume':
-    model, checkpoint = GPT.from_checkpoint(os.path.join(out_dir, 'ckpt.pt'), device, dropout_p=0.0)
+    model, checkpoint = load_checkpoint(os.path.join(out_dir, 'ckpt.pt'), device, dropout_p=0.0)
 elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
+    from src.models.gpt.model import GPT
     model = GPT.from_pretrained(init_from, dropout_p=0.0)
 else:
     raise ValueError(f"init_from must be 'resume' or a gpt2 variant, got {init_from!r}")
@@ -84,6 +86,25 @@ elif tokenizer == 'auto':
 else:
     raise ValueError(f"tokenizer must be 'auto' or 'gpt2bpe', got {tokenizer!r}")
 
+
+@torch.no_grad()
+def generate(idx, max_new_tokens, temperature=1.0, top_k=None):
+    """Autoregressive sampling that works for any model returning logits (or a (logits, ...) tuple)."""
+    block_size = getattr(model, 'block_size', None)
+    for _ in range(max_new_tokens):
+        idx_cond = idx if block_size is None or idx.shape[1] <= block_size else idx[:, -block_size:]
+        logits = model(idx_cond)
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        logits = logits[:, -1, :].float() / temperature
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
+            logits[logits < v[:, [-1]]] = -float('inf')
+        idx_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+        idx = torch.cat((idx, idx_next), dim=1)
+    return idx
+
+
 # encode the beginning of the prompt
 if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
@@ -92,9 +113,8 @@ start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            y = model.generate_sample(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+with ctx:
+    for k in range(num_samples):
+        y = generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+        print(decode(y[0].tolist()))
+        print('---------------')

@@ -1,18 +1,19 @@
 """
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+Model-agnostic training script (single GPU or DDP). The model is chosen with `model_type` in the config:
+gpt, llama, mamba or mixtral (see `src/models/registry.py`).
 
 Run from anywhere; config files are resolved relative to the current directory:
-$ python src/models/gpt/train.py config/train_shakespeare_char.py --batch_size=32 --compile=False
+$ python src/models/train.py config/train_shakespeare_char.py --batch_size=32 --compile=False
+$ python src/models/train.py config/train_shakespeare_char_llama.py
 
 To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
+$ torchrun --standalone --nproc_per_node=4 src/models/train.py config/train_shakespeare_char.py
 
 To run with DDP on 4 gpus across 2 nodes, example:
 - Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 src/models/train.py
 - Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 src/models/train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
@@ -25,13 +26,14 @@ from contextlib import nullcontext
 import sys
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
-_project_root = os.path.abspath(os.path.join(_script_dir, '..', '..', '..'))
+_project_root = os.path.abspath(os.path.join(_script_dir, '..', '..'))
 sys.path.append(_project_root)
-from src.models.gpt.model import GPT
+from src.models.registry import build_model, load_checkpoint, configure_optimizers, estimate_mfu
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -53,11 +55,21 @@ gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
+model_type = 'gpt' # 'gpt', 'llama', 'mamba' or 'mixtral'
 n_layers = 12
 n_heads = 12
 embed_dim = 768
 dropout_p = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# llama / mixtral
+n_kv_heads = 0 # grouped-query attention; 0 = same as n_heads
+ffn_hidden_dim = 0 # 0 = model default (SwiGLU: 4 * embed_dim * 2/3, rounded up to a multiple of 256)
+# mixtral
+n_experts = 8
+n_experts_per_tok = 2
+# mamba
+d_state = 16 # SSM state size
+expand = 2 # inner dim = expand * embed_dim
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 1001 # total number of training iterations
@@ -160,38 +172,38 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 # model init
-model_args = dict(n_layers=n_layers, n_heads=n_heads, embed_dim=embed_dim, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout_p=dropout_p) # start with model_args from command line
+model_args = dict(model_type=model_type, n_layers=n_layers, n_heads=n_heads, embed_dim=embed_dim, block_size=block_size,
+                  bias=bias, vocab_size=None, dropout_p=dropout_p, n_kv_heads=n_kv_heads, ffn_hidden_dim=ffn_hidden_dim,
+                  n_experts=n_experts, n_experts_per_tok=n_experts_per_tok, d_state=d_state, expand=expand)
 if init_from == 'scratch':
     # init a new model from scratch
-    print("Initializing a new model from scratch")
+    print(f"Initializing a new {model_type} model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    model = GPT(**model_args)
+    model = build_model(**model_args)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # architecture comes from the checkpoint; dropout can still be changed from the command line
-    model, checkpoint = GPT.from_checkpoint(os.path.join(out_dir, 'ckpt.pt'), device, dropout_p=dropout_p)
+    model, checkpoint = load_checkpoint(os.path.join(out_dir, 'ckpt.pt'), device, dropout_p=dropout_p)
     model_args = dict(checkpoint['model_args'], dropout_p=dropout_p)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
+    from src.models.gpt.model import GPT
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
     model = GPT.from_pretrained(init_from, dropout_p=dropout_p)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layers', 'n_heads', 'embed_dim', 'block_size', 'vocab_size']:
-        model_args[k] = getattr(model, k)
-    model_args['bias'] = True # GPT-2 always has biases
+    model_args.update(model_type='gpt', bias=True, **{k: getattr(model, k) for k in ['n_layers', 'n_heads', 'embed_dim', 'block_size', 'vocab_size']})
 model.to(device)
+print(f"{model_type}: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
     checkpoint = None # free up memory
@@ -207,6 +219,13 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+def compute_loss(X, Y):
+    """Next-token cross entropy. Models may return logits or a (logits, ...) tuple."""
+    logits = model(X)
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), Y.reshape(-1))
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -217,7 +236,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, targets=Y)
+                loss = compute_loss(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -293,8 +312,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, targets=Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            loss = compute_loss(X, Y) / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -318,7 +336,7 @@ while True:
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
