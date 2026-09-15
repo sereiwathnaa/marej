@@ -1,7 +1,5 @@
 import os
 import sys
-import inspect
-from dataclasses import dataclass
 
 import torch
 from torch import nn, Tensor
@@ -11,17 +9,6 @@ import torch.nn.functional as F
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from src.layers.normalization import LayerNorm
 from src.layers.attention import MultiheadAttention
-
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layers: int = 12
-    n_heads: int = 12
-    embed_dim: int = 768
-    dropout_p: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-
 
 class GPT(nn.Module):
     def __init__(self,
@@ -33,7 +20,6 @@ class GPT(nn.Module):
                  dropout_p: float,
                  bias: bool=True):
         super().__init__()
-        self.dim_head = embed_dim // n_heads
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.embed_dim = embed_dim
@@ -46,7 +32,7 @@ class GPT(nn.Module):
         self.position_embeddings = nn.Embedding(block_size, embed_dim)
 
         self.decoder_blocks = nn.ModuleList(
-            [DecoderBlock(embed_dim, n_heads, self.dim_head, dropout_p) for _ in range(n_layers)]
+            [DecoderBlock(embed_dim, n_heads, dropout_p) for _ in range(n_layers)]
         )
 
         self.layer_norm = LayerNorm(embed_dim, bias=bias)
@@ -104,107 +90,66 @@ class GPT(nn.Module):
 
     @staticmethod
     def from_pretrained(model_name: str, dropout_p: float=None):
+        """Load OpenAI GPT-2 weights ('gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl') via HuggingFace."""
         from transformers import GPT2LMHeadModel
         model_names = ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"]
         if model_name not in model_names:
             raise ValueError(f"Invalid model name, the {model_name} is not one of {model_names}")
 
         model_hf = GPT2LMHeadModel.from_pretrained(model_name)
+        model = GPT(n_layers=len(model_hf.transformer.h),
+                    n_heads=model_hf.transformer.h[0].attn.num_heads,
+                    embed_dim=model_hf.transformer.h[0].attn.embed_dim,
+                    vocab_size=model_hf.lm_head.out_features,
+                    block_size=model_hf.transformer.wpe.num_embeddings,
+                    dropout_p=model_hf.transformer.drop.p if dropout_p is None else dropout_p)
 
-        config = {
-            'n_layers': len(model_hf.transformer.h),
-            'n_heads': model_hf.transformer.h[0].attn.num_heads,
-            'embed_dim': model_hf.transformer.h[0].attn.embed_dim,
-            'vocab_size': model_hf.lm_head.out_features,
-            'block_size': model_hf.transformer.wpe.num_embeddings,
-            'dropout_p': model_hf.transformer.drop.p if dropout_p is None else dropout_p,
-        }
+        # our name -> (HF name, transpose?). HF's Conv1D layers store weights as (in, out), nn.Linear as (out, in).
+        mapping = {"output_projection": ("transformer.wte.weight", False),
+                   "position_embeddings.weight": ("transformer.wpe.weight", False),
+                   "layer_norm.weight": ("transformer.ln_f.weight", False),
+                   "layer_norm.bias": ("transformer.ln_f.bias", False)}
+        linears = {"attn.to_qkv": "attn.c_attn", "attn.to_out": "attn.c_proj", "ffn.linear1": "mlp.c_fc", "ffn.linear2": "mlp.c_proj"}
+        norms = {"ln1": "ln_1", "ln2": "ln_2"}
+        for i in range(model.n_layers):
+            for ours, theirs in {**linears, **norms}.items():
+                for suffix in ("weight", "bias"):
+                    transpose = ours in linears and suffix == "weight"
+                    mapping[f"decoder_blocks.{i}.{ours}.{suffix}"] = (f"transformer.h.{i}.{theirs}.{suffix}", transpose)
 
-        model = GPT(**config)
-
-        sd_hf = model_hf.state_dict()
-        sd = model.state_dict()
-
-        sd["output_projection"].copy_(sd_hf["transformer.wte.weight"])
-        # sd["word_embeddings.weight"].copy_(sd_hf["transformer.wte.weight"])
-        sd["position_embeddings.weight"].copy_(sd_hf["transformer.wpe.weight"])
-
-        for i in range(config["n_layers"]):
-            prefix = f"transformer.h.{i}"
-
-            c_attn_weight = sd_hf[f"{prefix}.attn.c_attn.weight"]
-            c_attn_bias = sd_hf[f"{prefix}.attn.c_attn.bias"]
-
-            # attention proj
-            sd[f"decoder_blocks.{i}.attn.to_qkv.weight"].copy_(c_attn_weight.t())
-            sd[f"decoder_blocks.{i}.attn.to_qkv.bias"].copy_(c_attn_bias)
-            
-            # attention out
-            sd[f"decoder_blocks.{i}.attn.to_out.weight"].copy_(
-                sd_hf[f"{prefix}.attn.c_proj.weight"].t()
-            )
-            sd[f"decoder_blocks.{i}.attn.to_out.bias"].copy_(
-                sd_hf[f"{prefix}.attn.c_proj.bias"]
-            )
-            
-            # ffn
-            sd[f"decoder_blocks.{i}.ffn.linear1.weight"].copy_(
-                sd_hf[f"{prefix}.mlp.c_fc.weight"].t()
-            )
-            sd[f"decoder_blocks.{i}.ffn.linear1.bias"].copy_(
-                sd_hf[f"{prefix}.mlp.c_fc.bias"]
-            ) 
-
-            sd[f"decoder_blocks.{i}.ffn.linear2.weight"].copy_(
-                sd_hf[f"{prefix}.mlp.c_proj.weight"].t()
-            )
-            sd[f"decoder_blocks.{i}.ffn.linear2.bias"].copy_(
-                sd_hf[f"{prefix}.mlp.c_proj.bias"]
-            )
-
-            # layernorm
-            sd[f"decoder_blocks.{i}.ln1.weight"].copy_(
-                sd_hf[f"{prefix}.ln_1.weight"]
-            )
-            sd[f"decoder_blocks.{i}.ln1.bias"].copy_(
-                sd_hf[f"{prefix}.ln_1.bias"]
-            )
-            sd[f"decoder_blocks.{i}.ln2.weight"].copy_(
-                sd_hf[f"{prefix}.ln_2.weight"]
-            )
-            sd[f"decoder_blocks.{i}.ln2.bias"].copy_(
-                sd_hf[f"{prefix}.ln_2.bias"]
-            )
-        sd["layer_norm.weight"].copy_(sd_hf["transformer.ln_f.weight"])
-        sd["layer_norm.bias"].copy_(sd_hf["transformer.ln_f.bias"])
-        
+        sd, sd_hf = model.state_dict(), model_hf.state_dict()
+        with torch.no_grad():
+            for ours, (theirs, transpose) in mapping.items():
+                sd[ours].copy_(sd_hf[theirs].t() if transpose else sd_hf[theirs])
         return model
 
+    @staticmethod
+    def from_checkpoint(ckpt_path: str, device: str, dropout_p: float=None):
+        """Load a checkpoint written by train.py. Returns (model, checkpoint dict).
+
+        Strips the '_orig_mod.' prefix that torch.compile adds to state dict keys.
+        """
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model_args = dict(checkpoint['model_args'])
+        if dropout_p is not None:
+            model_args['dropout_p'] = dropout_p
+        model = GPT(**model_args)
+        state_dict = {k.removeprefix('_orig_mod.'): v for k, v in checkpoint['model'].items()}
+        model.load_state_dict(state_dict)
+        return model, checkpoint
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        """AdamW with weight decay on matrices/embeddings only (biases and layernorm weights are not decayed)."""
+        params = [p for p in self.parameters() if p.requires_grad]
+        decay_params = [p for p in params if p.dim() >= 2]
+        nodecay_params = [p for p in params if p.dim() < 2]
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {sum(p.numel() for p in decay_params):,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {sum(p.numel() for p in nodecay_params):,} parameters")
+        return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=(device_type == 'cuda'))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -253,14 +198,12 @@ class DecoderBlock(nn.Module):
     def __init__(self,
                  embed_dim: int,
                  n_heads: int,
-                 dim_head: int,
-                 dropout_p: float,
-                 ):
+                 dropout_p: float):
         super().__init__()
         self.dropout = nn.Dropout(dropout_p)
 
         self.ln1 = LayerNorm(embed_dim)
-        self.attn = MultiheadAttention(embed_dim, n_heads, dim_head, dropout_p, use_flash=True)
+        self.attn = MultiheadAttention(embed_dim, n_heads, embed_dim // n_heads, dropout_p, use_flash=True)
         self.ln2 = LayerNorm(embed_dim)
         self.ffn = FeedForwardBlock(embed_dim, embed_dim * 4)
     

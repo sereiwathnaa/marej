@@ -172,24 +172,9 @@ if init_from == 'scratch':
     model = GPT(**model_args)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layers', 'n_heads', 'embed_dim', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    model = GPT(**model_args)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    # architecture comes from the checkpoint; dropout can still be changed from the command line
+    model, checkpoint = GPT.from_checkpoint(os.path.join(out_dir, 'ckpt.pt'), device, dropout_p=dropout_p)
+    model_args = dict(checkpoint['model_args'], dropout_p=dropout_p)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
@@ -200,10 +185,6 @@ elif init_from.startswith('gpt2'):
     for k in ['n_layers', 'n_heads', 'embed_dim', 'block_size', 'vocab_size']:
         model_args[k] = getattr(model, k)
     model_args['bias'] = True # GPT-2 always has biases
-# crop down the model block size if desired, using model surgery
-# if block_size < model.block_size:
-#     model.crop_block_size(block_size)
-#     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -213,7 +194,7 @@ scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
+    checkpoint = None # free up memory
 
 raw_model = model # unwrapped model, for checkpoints and mfu; compile/DDP share its parameters
 
@@ -236,7 +217,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, targets=Y, use_kv_cache=False)
+                logits, loss = model(X, targets=Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -312,7 +293,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, targets=Y, use_kv_cache=False)
+            logits, loss = model(X, targets=Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
