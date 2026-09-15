@@ -9,6 +9,7 @@ from typing import Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange, repeat, einsum
 
 # project root, so `from src...` works whether run as a script, notebook, or module
@@ -27,6 +28,9 @@ class ModelArgs:
     pad_vocab_size_multiple: int = 8
     conv_bias: bool = True
     bias: bool = False
+    # 'parallel': log2(L)-step Hillis-Steele scan with gradient checkpointing (fast, low memory; use for training)
+    # 'sequential': token-by-token reference loop
+    scan: str = 'parallel'
     
     def __post_init__(self):
         self.d_inner = int(self.expand * self.d_model)
@@ -62,6 +66,29 @@ class Mamba(nn.Module):
         logits = einsum(x, self.lm_head.weight, 'b l d, v d -> b l v')
 
         return logits
+
+    def init_weights(self, dt_min: float=1e-3, dt_max: float=1e-1):
+        """From-scratch init (not needed when loading pretrained weights).
+
+        Embedding / linear weights ~ N(0, 0.02) as in GPT-2 (the embedding is tied to the LM head, so the
+        default N(0, 1) init gives logits of order sqrt(d_model)); out_proj scaled by 1/sqrt(2 n_layer) for
+        the residual stream; dt_proj initialised as in the Mamba reference so softplus(dt_proj bias) is
+        log-uniform in [dt_min, dt_max].
+        """
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                nn.init.normal_(module.weight, std=0.02)
+                if getattr(module, 'bias', None) is not None:
+                    nn.init.zeros_(module.bias)
+        for layer in self.layers:
+            mixer = layer.mixer
+            nn.init.normal_(mixer.out_proj.weight, std=0.02 / math.sqrt(2 * self.args.n_layer))
+            dt_init_std = self.args.dt_rank ** -0.5
+            nn.init.uniform_(mixer.dt_proj.weight, -dt_init_std, dt_init_std)
+            dt = torch.exp(torch.rand(self.args.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+            dt = dt.clamp(min=1e-4)
+            with torch.no_grad():
+                mixer.dt_proj.bias.copy_(dt + torch.log(-torch.expm1(-dt)))  # inverse softplus
     
 class ResidualBlock(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -152,10 +179,10 @@ class MambaBlock(nn.Module):
         return y
 
     def selective_scan(self, u, delta, A, B, C, D):
+        """h_t = exp(delta_t A) h_{t-1} + delta_t B_t u_t ;  y_t = C_t . h_t + D u_t
 
-        (b, l, d_in) = u.shape
-        n = A.shape[1]
-
+        Shapes: u, delta (b, l, d_in); A (d_in, n); B, C (b, l, n); D (d_in). Returns (b, l, d_in).
+        """
         delta = delta.unsqueeze(-1)
         
         # deltaA: (b, l, d_in, n)
@@ -163,19 +190,67 @@ class MambaBlock(nn.Module):
         
         # deltaB_u: (b, l, d_in, n)
         deltaB_u = delta * B.unsqueeze(2) * u.unsqueeze(-1)
-        
-        x = torch.zeros((b, d_in, n), device=deltaA.device)
-        ys = []    
-        for i in range(l):
-            x = deltaA[:, i] * x + deltaB_u[:, i]
-            y = torch.sum(x * C[:, i:i+1, :], dim=-1)
-            ys.append(y)
-        
-        y = torch.stack(ys, dim=1)  # shape (b, l, d_in)
-        
+
+        if self.args.scan == 'parallel':
+            # recompute the scan in backward instead of storing log2(L) full-size intermediates
+            h = checkpoint(self.parallel_scan, deltaA, deltaB_u, use_reentrant=False)
+        else:
+            h = self.sequential_scan(deltaA, deltaB_u)
+
+        y = einsum(h, C, 'b l d n, b l n -> b l d')
         y = y + u * D
 
         return y
+
+    @staticmethod
+    def sequential_scan(a, b):
+        """Reference: h_t = a_t * h_{t-1} + b_t, one step at a time. a, b, out: (b, l, d_in, n)."""
+        h = torch.zeros_like(b[:, 0])
+        hs = []
+        for i in range(a.shape[1]):
+            h = a[:, i] * h + b[:, i]
+            hs.append(h)
+        return torch.stack(hs, dim=1)
+
+    @staticmethod
+    def parallel_scan(a, b, chunk: int=16):
+        """Same recurrence with a chunked Hillis-Steele scan: log2(chunk) rounds of whole-tensor ops inside each
+        chunk, then a cheap sequential carry across the L/chunk chunk boundaries.
+
+        (a_t, b_t) represents the affine map h -> a_t h + b_t of one step; composing the maps of steps
+        [t-k, t] with [t-2k, t-k) doubles the span each round, so after the rounds a_t is the cumulative
+        product from the chunk start and b_t is the state assuming h = 0 at the chunk start.
+        """
+        bsz, L, d, n = a.shape
+        pad = (-L) % chunk
+        if pad:
+            a = F.pad(a, (0, 0, 0, 0, 0, pad), value=1.)   # identity steps at the end
+            b = F.pad(b, (0, 0, 0, 0, 0, pad), value=0.)
+        a = a.reshape(bsz, -1, chunk, d, n)
+        b = b.reshape(bsz, -1, chunk, d, n)
+
+        # roll + where instead of pad/slice: their backward passes are rolls and masks, no zero-filled copies
+        pos = torch.arange(chunk, device=a.device).view(1, 1, chunk, 1, 1)
+        k = 1
+        while k < chunk:
+            valid = pos >= k                                                    # positions with a step k back
+            a_prev = torch.where(valid, a.roll(k, dims=2), 1.)                  # identity map where none
+            b_prev = torch.where(valid, b.roll(k, dims=2), 0.)
+            b = b + a * b_prev
+            a = a * a_prev
+            k *= 2
+
+        # carry the state across chunks: h_end(j) = b_end(j) + a_end(j) * h_end(j-1)
+        a_end, b_end = a[:, :, -1].unbind(1), b[:, :, -1].unbind(1)           # slice once, not per chunk
+        carry = torch.zeros_like(b_end[0])
+        carries = []
+        for j in range(len(a_end)):
+            carries.append(carry)
+            carry = b_end[j] + a_end[j] * carry
+        carries = torch.stack(carries, dim=1).unsqueeze(2)                 # (bsz, n_chunks, 1, d, n)
+
+        h = (b + a * carries).reshape(bsz, -1, d, n)
+        return h[:, :L]
 
 
 def load_pretrained_mamba(pretrained_model_name: str, device=None):

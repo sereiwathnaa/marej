@@ -23,6 +23,21 @@ def build_model(model_type: str, **args):
         return Llama(n_layers=args['n_layers'], n_heads=args['n_heads'], embed_dim=args['embed_dim'],
                      vocab_size=args['vocab_size'], block_size=args['block_size'],
                      n_kv_heads=args['n_kv_heads'] or None, ffn_hidden_dim=args['ffn_hidden_dim'] or None)
+    if model_type == 'mamba':
+        from src.models.mamba.model import Mamba, ModelArgs
+        model = Mamba(ModelArgs(d_model=args['embed_dim'], n_layer=args['n_layers'], vocab_size=args['vocab_size'],
+                                d_state=args['d_state'], expand=args['expand'], pad_vocab_size_multiple=1))
+        model.init_weights()
+        return model
+    if model_type == 'mixtral':
+        from src.models.mixtral.model import Mixtral
+        model = Mixtral(n_layers=args['n_layers'], n_heads=args['n_heads'], embed_dim=args['embed_dim'],
+                        n_experts=args['n_experts'], n_experts_per_tok=args['n_experts_per_tok'],
+                        vocab_size=args['vocab_size'], block_size=args['block_size'],
+                        n_kv_heads=args['n_kv_heads'] or None, ffn_hidden_dim=args['ffn_hidden_dim'] or None,
+                        dense_moe=True)
+        model.init_weights()
+        return model
     raise ValueError(f"unknown model_type {model_type!r}")
 
 
