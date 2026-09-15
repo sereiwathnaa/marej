@@ -1,3 +1,6 @@
-from .normalization import LayerNorm
-from .attention import MultiheadAttention
-from .deltaattention import KimiDeltaAttention
+from .normalization import LayerNorm, RMSNorm
+from .dotproductattention import DotProductAttention
+from .multiheadattention import MultiheadAttention
+from .groupedqueryattention import GroupedQueryRotaryAttention
+from .sparseattention import FixedSparseAttention, StridedSparseAttention
+from .deltaattention import KimiDeltaAttention, GatedDeltaRule

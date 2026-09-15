@@ -40,22 +40,6 @@ def get_batch(split, gen):
     return x.to(device), y.to(device)
 
 
-class SparseAdapter(nn.Module):
-    """Fixed/StridedSparseAttention only take x; adapt to the (x, attn_mask, use_kv_cache) interface."""
-    def __init__(self, inner):
-        super().__init__()
-        self.inner = inner
-        self.kv_cache = None
-
-    def forward(self, x, attn_mask=None, use_kv_cache=False):
-        if use_kv_cache:
-            raise NotImplementedError("sparse attention has no KV cache")
-        return self.inner(x)
-
-    def get_kv_cache_seqlen(self): return 0
-    def clear_kv_cache(self): pass
-
-
 VARIANTS = {
     "MultiheadAttention (flash)":            lambda: MultiheadAttention(EMBED, N_HEADS, DIM_HEAD, 0., use_flash=True),
     "MultiheadAttention (manual softmax)":   lambda: MultiheadAttention(EMBED, N_HEADS, DIM_HEAD, 0., use_flash=False),
@@ -63,8 +47,8 @@ VARIANTS = {
     "GQRA rotary":                           lambda: GroupedQueryRotaryAttention(EMBED, N_HEADS, N_HEADS, 0., apply_rotary_embedding=True, max_seqlen=BLOCK),
     "GQRA rotary, 2 kv heads, qk_norm":      lambda: GroupedQueryRotaryAttention(EMBED, N_HEADS, 2, 0., apply_rotary_embedding=True, max_seqlen=BLOCK, qk_norm=True),
     "GQRA rotary, manual softmax":           lambda: GroupedQueryRotaryAttention(EMBED, N_HEADS, N_HEADS, 0., apply_rotary_embedding=True, max_seqlen=BLOCK, use_flash=False),
-    f"FixedSparseAttention (block {SPARSE_BLOCK})":   lambda: SparseAdapter(FixedSparseAttention(EMBED, N_HEADS, DIM_HEAD, block_size=SPARSE_BLOCK)),
-    f"StridedSparseAttention (block {SPARSE_BLOCK})": lambda: SparseAdapter(StridedSparseAttention(EMBED, N_HEADS, DIM_HEAD, block_size=SPARSE_BLOCK)),
+    f"FixedSparseAttention (block {SPARSE_BLOCK})":   lambda: FixedSparseAttention(EMBED, N_HEADS, DIM_HEAD, block_size=SPARSE_BLOCK),
+    f"StridedSparseAttention (block {SPARSE_BLOCK})": lambda: StridedSparseAttention(EMBED, N_HEADS, DIM_HEAD, block_size=SPARSE_BLOCK),
     "KimiDeltaAttention (chunk 32)":         lambda: KimiDeltaAttention(EMBED, N_HEADS, chunk_size=32),
 }
 
@@ -121,23 +105,12 @@ def kv_cache_consistency(model):
 
 
 @torch.no_grad()
-def sample(model, use_kv_cache):
+def sample(model):
     model.eval()
     prompt = torch.tensor([[stoi[c] for c in "ROMEO:\n"]], device=device)
     model.clear_kv_cache()
     torch.manual_seed(0)
-    if use_kv_cache:
-        toks = [t[0] for t in batch_generation(model, prompt, 120, top_k=20, temperature=0.8, use_kv_cache=True)]
-    else:
-        # sparse attention needs seqlen % SPARSE_BLOCK == 0: right-pad (causal, so padding cannot leak backwards)
-        idx = prompt
-        for _ in range(120):
-            pad = (-idx.shape[1]) % SPARSE_BLOCK
-            logits = model(torch.nn.functional.pad(idx, (0, pad)))[:, idx.shape[1] - 1] / 0.8
-            v, _ = torch.topk(logits, 20)
-            logits[logits < v[:, [-1]]] = -float("inf")
-            idx = torch.cat([idx, torch.multinomial(torch.softmax(logits, -1), 1)], dim=1)
-        toks = idx[0, prompt.shape[1]:].tolist()
+    toks = [t[0] for t in batch_generation(model, prompt, 120, top_k=20, temperature=0.8, use_kv_cache=True)]
     model.clear_kv_cache()
     return decode(toks)
 
@@ -173,9 +146,8 @@ for name, make_attn in VARIANTS.items():
     res = {"params": n_params, "ms_per_iter": ms_per_iter,
            "train_loss": estimate_loss(model, "train"), "val_loss": estimate_loss(model, "val"),
            "causal_leak": causality_leak(model), "history": history}
-    supports_cache = not isinstance(model.decoder_blocks[0].attn, SparseAdapter)
-    res["kv_cache_err"] = kv_cache_consistency(model) if supports_cache else None
-    res["sample"] = sample(model, use_kv_cache=supports_cache)
+    res["kv_cache_err"] = kv_cache_consistency(model)
+    res["sample"] = sample(model)
     print(f"  final: train {res['train_loss']:.3f} | val {res['val_loss']:.3f} | causal leak {res['causal_leak']:.1e}"
           f" | kv-cache err {res['kv_cache_err']} | {ms_per_iter:.1f} ms/iter | params {n_params:,}")
     print("  sample: " + repr(res["sample"][:100]))
@@ -186,5 +158,4 @@ json.dump(results, open(os.path.join(os.path.dirname(__file__), "bench_results.j
 print("\n" + "=" * 100)
 print(f"{'variant':40s} {'val loss':>9s} {'train':>7s} {'leak':>8s} {'kv err':>8s} {'ms/iter':>8s}")
 for name, r in results.items():
-    kv = "n/a" if r["kv_cache_err"] is None else f"{r['kv_cache_err']:.1e}"
-    print(f"{name:40s} {r['val_loss']:9.3f} {r['train_loss']:7.3f} {r['causal_leak']:8.1e} {kv:>8s} {r['ms_per_iter']:8.1f}")
+    print(f"{name:40s} {r['val_loss']:9.3f} {r['train_loss']:7.3f} {r['causal_leak']:8.1e} {r['kv_cache_err']:8.1e} {r['ms_per_iter']:8.1f}")
